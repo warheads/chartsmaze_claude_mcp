@@ -248,13 +248,6 @@ class TradingViewClient:
             return data
         return data.get("lists", data.get("watchlists", data.get("data", [])))
 
-    async def get_watchlist(self, watchlist_id: str) -> dict:
-        """Return a single watchlist by ID (includes its symbol list)."""
-        await self._discover_list_url()
-        url  = f"{self._crud_url}{watchlist_id}/"
-        resp = await self._request("GET", url, params={"populate_data": "false"})
-        return resp.json()
-
     async def create_watchlist(self, name: str, symbols: list[str]) -> dict:
         """Create a new watchlist."""
         await self._discover_list_url()
@@ -297,8 +290,8 @@ class TradingViewClient:
             }
 
         wl_id   = existing.get("id") or existing.get("uuid")
-        full    = await self.get_watchlist(wl_id)
-        current: list[str] = full.get("symbols", [])
+        # The list response already includes the symbol array — no separate GET needed.
+        current: list[str] = existing.get("symbols", [])
 
         if replace:
             merged = symbols
