@@ -18,8 +18,9 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-_TV_API = "https://api.tradingview.com"
-_TV_ORIGIN = "https://www.tradingview.com"
+_TV_BASE = "https://www.tradingview.com"
+_TV_API = _TV_BASE  # watchlist endpoints live under www.tradingview.com
+_TV_ORIGIN = _TV_BASE
 
 
 class TradingViewClient:
@@ -54,12 +55,34 @@ class TradingViewClient:
         if self._client:
             await self._client.aclose()
 
+    # ------------------------------------------------------------------ helpers
+
+    async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
+        url = f"{_TV_API}{path}"
+        try:
+            resp = await self._client.request(method, url, **kwargs)
+        except httpx.ConnectError as exc:
+            raise RuntimeError(
+                f"Cannot reach TradingView ({url}). "
+                "Check your internet connection and DNS settings."
+            ) from exc
+        except httpx.TimeoutException as exc:
+            raise RuntimeError(f"Request to TradingView timed out: {url}") from exc
+
+        if resp.status_code in (401, 403):
+            raise PermissionError(
+                f"TradingView authentication failed (HTTP {resp.status_code}). "
+                "Your TRADINGVIEW_SESSION cookie may have expired — "
+                "re-copy it from DevTools → Application → Cookies → tradingview.com → sessionid."
+            )
+        resp.raise_for_status()
+        return resp
+
     # ------------------------------------------------------------------ public API
 
     async def list_watchlists(self) -> list[dict]:
         """Return all watchlists for the authenticated user."""
-        resp = await self._client.get(f"{_TV_API}/market-lists/v3/lists/")
-        resp.raise_for_status()
+        resp = await self._request("GET", "/market-lists/v3/lists/")
         data = resp.json()
         # API may return a list directly or {"lists": [...]}
         if isinstance(data, list):
@@ -68,29 +91,29 @@ class TradingViewClient:
 
     async def get_watchlist(self, watchlist_id: str) -> dict:
         """Return a single watchlist by ID (includes its symbol list)."""
-        resp = await self._client.get(
-            f"{_TV_API}/market-lists/v3/list/{watchlist_id}/",
+        resp = await self._request(
+            "GET",
+            f"/market-lists/v3/list/{watchlist_id}/",
             params={"populate_data": "false"},
         )
-        resp.raise_for_status()
         return resp.json()
 
     async def create_watchlist(self, name: str, symbols: list[str]) -> dict:
         """Create a new watchlist."""
-        resp = await self._client.post(
-            f"{_TV_API}/market-lists/v3/list/",
+        resp = await self._request(
+            "POST",
+            "/market-lists/v3/list/",
             json={"name": name, "symbols": symbols},
         )
-        resp.raise_for_status()
         return resp.json()
 
     async def update_watchlist(self, watchlist_id: str, name: str, symbols: list[str]) -> dict:
         """Replace a watchlist's name and symbol list."""
-        resp = await self._client.put(
-            f"{_TV_API}/market-lists/v3/list/{watchlist_id}/",
+        resp = await self._request(
+            "PUT",
+            f"/market-lists/v3/list/{watchlist_id}/",
             json={"name": name, "symbols": symbols},
         )
-        resp.raise_for_status()
         return resp.json()
 
     async def add_to_watchlist(
