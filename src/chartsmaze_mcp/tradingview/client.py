@@ -220,7 +220,15 @@ class TradingViewClient:
                 "Your TRADINGVIEW_SESSION cookie may be expired — re-copy from "
                 "DevTools → Application → Cookies → tradingview.com → sessionid."
             )
-        resp.raise_for_status()
+        if not resp.is_success:
+            try:
+                body = resp.text[:500]
+            except Exception:
+                body = "(unreadable)"
+            raise RuntimeError(
+                f"TradingView {method} {url} → HTTP {resp.status_code}\n"
+                f"Response body: {body}"
+            )
         return resp
 
     # ------------------------------------------------------------------ public API
