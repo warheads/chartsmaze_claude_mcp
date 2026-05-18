@@ -2,8 +2,8 @@
 TradingView watchlist client.
 
 Uses Playwright to discover the live watchlist API endpoints by intercepting
-the requests TradingView makes when it loads your watchlists.  Once discovered
-the actual CRUD calls are made directly with httpx (no browser needed).
+the requests TradingView makes when it loads.  Once discovered, the actual
+CRUD calls are made directly with httpx (no browser needed).
 
 Authentication: set TRADINGVIEW_SESSION (and optionally TRADINGVIEW_SESSION_SIGN)
 from the cookies in your TradingView browser session.
@@ -32,18 +32,36 @@ _UA = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Regex that matches any TradingView URL that looks like a watchlist list endpoint,
-# e.g. https://www.tradingview.com/api/v1/watchlists/
-#       https://www.tradingview.com/market-lists/v2/lists/
-# Capture group 1 = everything up to and including the trailing slash.
-_LIST_URL_RE = re.compile(
-    r"(https://(?:www\.)?tradingview\.com"
-    r"/(?:[a-z0-9_-]+/)*"           # path segments
-    r"(?:watchlists?|market-lists?|lists?)"
-    r"/(?:v\d+/)?(?:lists?|watchlists?)/"
-    r")",
+# Matches the base symbols_list path on any TradingView subdomain, e.g.:
+#   https://in.tradingview.com/api/v1/symbols_list/all/?source=web
+#   https://www.tradingview.com/api/v2/symbols_lists/custom/
+# Captures group 1 = everything up to and including "symbols_list(s)/",
+# and group 2 = the optional sub-bucket (all | custom | colored | …)
+_SYMBOLS_LIST_RE = re.compile(
+    r"(https://[a-z]+\.tradingview\.com(?:/api/v\d+)?/symbols?_lists?/)"
+    r"([a-z]*/)?",
     re.IGNORECASE,
 )
+
+
+def _crud_base(list_url: str) -> str:
+    """
+    Strip the sub-bucket suffix so we get the plain CRUD base, e.g.:
+      https://in.tradingview.com/api/v1/symbols_list/all/  →
+      https://in.tradingview.com/api/v1/symbols_list/
+    """
+    m = _SYMBOLS_LIST_RE.match(list_url)
+    if m:
+        return m.group(1)
+    # Fallback: strip last path segment
+    url = list_url.split("?")[0].rstrip("/")
+    return url.rsplit("/", 1)[0] + "/"
+
+
+def _origin_from_url(url: str) -> str:
+    """https://in.tradingview.com/... → https://in.tradingview.com"""
+    m = re.match(r"(https://[^/]+)", url)
+    return m.group(1) if m else _TV_BASE
 
 
 class TradingViewClient:
@@ -51,11 +69,12 @@ class TradingViewClient:
         self._session_id   = session_id
         self._session_sign = session_sign
         self._pw           = None
-        self._browser: Optional[Browser]        = None
-        self._ctx:     Optional[BrowserContext] = None
+        self._browser: Optional[Browser]          = None
+        self._ctx:     Optional[BrowserContext]   = None
         self._http:    Optional[httpx.AsyncClient] = None
-        # Discovered at runtime: URL that returns the list of watchlists.
-        self._list_url: Optional[str] = None
+        # Populated by _discover_list_url():
+        self._list_url: Optional[str] = None   # URL for GET-all (may end with /all/)
+        self._crud_url: Optional[str] = None   # Base for create / item ops
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -73,24 +92,38 @@ class TradingViewClient:
             viewport={"width": 1280, "height": 900},
         )
         await self._ctx.add_cookies([
-            {"name": "sessionid", "value": self._session_id, "domain": ".tradingview.com", "path": "/"},
-            *([{"name": "sessionid_sign", "value": self._session_sign, "domain": ".tradingview.com", "path": "/"}]
-              if self._session_sign else []),
+            {
+                "name":   "sessionid",
+                "value":  self._session_id,
+                "domain": ".tradingview.com",
+                "path":   "/",
+            },
+            *([{
+                "name":   "sessionid_sign",
+                "value":  self._session_sign,
+                "domain": ".tradingview.com",
+                "path":   "/",
+            }] if self._session_sign else []),
         ])
-        cookie_header = f"sessionid={self._session_id}"
+        # httpx client is created with placeholder headers; Origin/Referer are
+        # updated after endpoint discovery so they match the real subdomain.
+        self._http = self._make_http_client(_TV_ORIGIN)
+        return self
+
+    def _make_http_client(self, origin: str) -> httpx.AsyncClient:
+        cookie = f"sessionid={self._session_id}"
         if self._session_sign:
-            cookie_header += f"; sessionid_sign={self._session_sign}"
-        self._http = httpx.AsyncClient(
+            cookie += f"; sessionid_sign={self._session_sign}"
+        return httpx.AsyncClient(
             headers={
-                "Cookie":       cookie_header,
-                "Origin":       _TV_ORIGIN,
-                "Referer":      _TV_ORIGIN + "/",
+                "Cookie":       cookie,
+                "Origin":       origin,
+                "Referer":      origin + "/",
                 "User-Agent":   _UA,
                 "Content-Type": "application/json",
             },
             timeout=30.0,
         )
-        return self
 
     async def __aexit__(self, *_: Any) -> None:
         if self._http:
@@ -136,23 +169,20 @@ class TradingViewClient:
         return calls
 
     async def _discover_list_url(self) -> str:
-        """
-        Load tradingview.com in a headless browser and intercept the GET request
-        that returns all watchlists.  Returns the full URL (with trailing slash).
-        """
         if self._list_url:
             return self._list_url
 
         calls = await self.discover_api_calls(_TV_BASE + "/")
 
-        # Filter to GET calls whose URL matches the watchlist pattern.
-        matched = [
-            c["url"] for c in calls
-            if c["method"] == "GET" and _LIST_URL_RE.search(c["url"])
-        ]
+        # Look for GET requests matching the symbols_list pattern on any subdomain.
+        matched: list[str] = []
+        for c in calls:
+            if c["method"] != "GET":
+                continue
+            if _SYMBOLS_LIST_RE.search(c["url"]):
+                matched.append(c["url"].split("?")[0])
 
         if not matched:
-            # Emit all captured URLs to help the user debug.
             captured = [f"  {c['method']} {c['url']}" for c in calls]
             hint = "\n".join(captured[:30]) if captured else "  (none)"
             raise RuntimeError(
@@ -163,15 +193,24 @@ class TradingViewClient:
                 "    Application → Cookies → tradingview.com → sessionid.\n"
                 "  • Watchlist URL pattern changed — run:\n"
                 "    chartsmaze tv-discover https://www.tradingview.com\n"
-                "    and look for the 'lists' GET call, then open an issue."
+                "    and look for the symbols_list GET call, then open an issue."
             )
 
-        # Normalise: strip query string, ensure trailing slash.
-        url = matched[0].split("?")[0].rstrip("/") + "/"
-        # Prefer the URL called most often (dedup redirects).
-        url = max(set(matched), key=matched.count).split("?")[0].rstrip("/") + "/"
-        self._list_url = url
-        logger.debug("Discovered watchlist list URL: %s", self._list_url)
+        # Use the URL seen most often; prefer /all/ over /custom/ or /colored/.
+        def _rank(u: str) -> int:
+            return matched.count(u) * 10 + (5 if "all" in u else 1)
+
+        best = max(set(matched), key=_rank)
+        self._list_url = best.rstrip("/") + "/"
+        self._crud_url = _crud_base(self._list_url)
+
+        # Re-initialise httpx with the correct Origin/Referer for this subdomain.
+        origin = _origin_from_url(self._list_url)
+        if origin != _TV_ORIGIN and self._http:
+            await self._http.aclose()
+            self._http = self._make_http_client(origin)
+
+        logger.debug("list_url=%s  crud_url=%s", self._list_url, self._crud_url)
         return self._list_url
 
     # ------------------------------------------------------------------ helpers
@@ -198,13 +237,6 @@ class TradingViewClient:
         resp.raise_for_status()
         return resp
 
-    def _item_url(self, list_url: str, item_id: str) -> str:
-        """Derive the single-item URL from the list URL, e.g. …/lists/ → …/list/{id}/"""
-        # list_url ends with /lists/ or /watchlists/ — swap for /list/{id}/
-        base = re.sub(r"(?:lists?|watchlists?)/$", "", list_url, flags=re.IGNORECASE)
-        segment = "watchlist" if "watchlist" in list_url.lower() else "list"
-        return f"{base}{segment}/{item_id}/"
-
     # ------------------------------------------------------------------ public API
 
     async def list_watchlists(self) -> list[dict]:
@@ -218,23 +250,23 @@ class TradingViewClient:
 
     async def get_watchlist(self, watchlist_id: str) -> dict:
         """Return a single watchlist by ID (includes its symbol list)."""
-        list_url = await self._discover_list_url()
-        url      = self._item_url(list_url, watchlist_id)
+        await self._discover_list_url()
+        url  = f"{self._crud_url}{watchlist_id}/"
         resp = await self._request("GET", url, params={"populate_data": "false"})
         return resp.json()
 
     async def create_watchlist(self, name: str, symbols: list[str]) -> dict:
         """Create a new watchlist."""
-        list_url = await self._discover_list_url()
+        await self._discover_list_url()
         resp = await self._request(
-            "POST", list_url, json={"name": name, "symbols": symbols}
+            "POST", self._crud_url, json={"name": name, "symbols": symbols}
         )
         return resp.json()
 
     async def update_watchlist(self, watchlist_id: str, name: str, symbols: list[str]) -> dict:
         """Replace a watchlist's name and symbol list."""
-        list_url = await self._discover_list_url()
-        url      = self._item_url(list_url, watchlist_id)
+        await self._discover_list_url()
+        url  = f"{self._crud_url}{watchlist_id}/"
         resp = await self._request("PUT", url, json={"name": name, "symbols": symbols})
         return resp.json()
 
@@ -258,10 +290,10 @@ class TradingViewClient:
         if existing is None:
             await self.create_watchlist(watchlist_name, symbols)
             return {
-                "status":        "created",
+                "status":         "created",
                 "watchlist_name": watchlist_name,
-                "symbols_added": symbols,
-                "total_symbols": len(symbols),
+                "symbols_added":  symbols,
+                "total_symbols":  len(symbols),
             }
 
         wl_id   = existing.get("id") or existing.get("uuid")
@@ -279,9 +311,9 @@ class TradingViewClient:
         added = [s for s in symbols if s not in set(current)]
         await self.update_watchlist(wl_id, watchlist_name, merged)
         return {
-            "status":        "updated",
+            "status":         "updated",
             "watchlist_name": watchlist_name,
-            "watchlist_id":  wl_id,
-            "symbols_added": added,
-            "total_symbols": len(merged),
+            "watchlist_id":   wl_id,
+            "symbols_added":  added,
+            "total_symbols":  len(merged),
         }
