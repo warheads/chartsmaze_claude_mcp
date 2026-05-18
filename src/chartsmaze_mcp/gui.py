@@ -85,6 +85,33 @@ _PERIODS = [
     ("3M", lambda i: i.rank_3m, lambda i: i.performance_3m),
 ]
 
+_SEC_SORT_KEYS: dict = {
+    "Sector": lambda s: s.name.lower(),
+    "Quad":   lambda s: s.quadrant.value if s.quadrant else "",
+    "RS":     lambda s: s.rs_ratio    or 0.0,
+    "Mom":    lambda s: s.rs_momentum or 0.0,
+    "Score":  lambda s: s.rrg_score(),
+}
+
+_IND_SORT_KEYS: dict = {
+    "Industry": lambda i: i.name.lower(),
+    "Quad":     lambda i: i.quadrant.value if i.quadrant else "",
+    "RS":       lambda i: i.rs_ratio    or 0.0,
+    "Mom":      lambda i: i.rs_momentum or 0.0,
+    "Trend":    lambda i: i.trend_score(),
+    "R1W":      lambda i: i.rank_1w   if i.rank_1w  is not None else 9999,
+    "R1M":      lambda i: i.rank_1m   if i.rank_1m  is not None else 9999,
+    "R3M":      lambda i: i.rank_3m   if i.rank_3m  is not None else 9999,
+    "P1W%":     lambda i: i.performance_1w  or 0.0,
+    "P1M%":     lambda i: i.performance_1m  or 0.0,
+    "P3M%":     lambda i: i.performance_3m  or 0.0,
+    "52W Hi%":  lambda i: i.from_52w_high_pct or 0.0,
+}
+
+_SEC_COLS = ["Sector", "Quad", "RS", "Mom", "Score"]
+_IND_COLS = ["Industry", "Quad", "RS", "Mom", "Trend",
+             "R1W", "R1M", "R3M", "P1W%", "P1M%", "P3M%", "52W Hi%"]
+
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -121,6 +148,7 @@ def _styled_tree(parent: tk.Widget, columns: list[str], widths: list[int]) -> tt
     for quad, color in _QUAD_FG.items():
         tree.tag_configure(quad, foreground=color)
     tree.tag_configure("dim", foreground=FG2)
+    tree.tag_configure("all", foreground=ACCENT)
     return tree
 
 
@@ -317,17 +345,20 @@ class ChartsMazeGUI(tk.Tk):
         self.configure(bg=BG)
         self.geometry("1400x860")
 
-        self._sectors:      list = []
-        self._industries:   dict[str, list] = {}
-        self._pool:         list = []
+        self._sectors:        list = []
+        self._industries:     dict[str, list] = {}
+        self._pool:           list = []
+        self._displayed_inds: list = []
         self._chart_figs:     list = []
         self._chart_canvases: list = []
-        self._chart_frames:   list = []          # parent frames for resize sync
-        self._detail_fig:    Optional["plt.Figure"] = None
-        self._detail_canvas = None
-        self._detail_frame:  Optional[tk.Frame] = None
-        self._sash_placed    = False
-        self._resize_timer   = None
+        self._chart_frames:   list = []
+        self._detail_fig:     Optional["plt.Figure"] = None
+        self._detail_canvas   = None
+        self._detail_frame:   Optional[tk.Frame] = None
+        self._sash_placed     = False
+        self._resize_timer    = None
+        self._sec_sort:       tuple = ("Score", True)
+        self._ind_sort:       tuple = ("Trend", True)
 
         self._build()
 
@@ -412,9 +443,11 @@ class ChartsMazeGUI(tk.Tk):
         tk.Label(pane, text="SECTORS", bg=BG, fg=FG2, font=_FONT_SM).pack(anchor="w", pady=(0, 4))
         self._sec_tree = _styled_tree(
             pane,
-            columns=["Sector",  "Quad",  "RS",   "Mom",  "Score"],
-            widths= [160,        82,      52,     52,     60],
+            columns=_SEC_COLS,
+            widths= [160, 82, 52, 52, 60],
         )
+        for col in _SEC_COLS:
+            self._sec_tree.heading(col, command=lambda c=col: self._sort_sector(c))
         self._sec_tree.bind("<<TreeviewSelect>>", self._on_sector_select)
 
     def _build_industry_panel(self, parent: tk.Widget) -> None:
@@ -424,11 +457,11 @@ class ChartsMazeGUI(tk.Tk):
         tk.Label(pane, text="INDUSTRIES", bg=BG, fg=FG2, font=_FONT_SM).pack(anchor="w", pady=(0, 4))
         self._ind_tree = _styled_tree(
             pane,
-            columns=["Industry", "Quad",  "RS",  "Mom", "Trend", "R1W", "R1M", "R3M",
-                     "P1W%", "P1M%", "P3M%", "52W Hi%"],
-            widths= [180,         82,      52,    52,    58,      42,    42,    42,
-                     58,    58,    58,    72],
+            columns=_IND_COLS,
+            widths= [180, 82, 52, 52, 58, 42, 42, 42, 58, 58, 58, 72],
         )
+        for col in _IND_COLS:
+            self._ind_tree.heading(col, command=lambda c=col: self._sort_industry(c))
         self._ind_tree.bind("<<TreeviewSelect>>", self._on_industry_select)
 
     def _build_detail_panel(self, parent: tk.Widget) -> None:
@@ -525,7 +558,7 @@ class ChartsMazeGUI(tk.Tk):
     def _fetch(self) -> None:
         self._btn.config(state="disabled")
         self._status_var.set("Loading data — this may take ~30 s…")
-        self._sectors = []; self._industries = {}; self._pool = []
+        self._sectors = []; self._industries = {}; self._pool = []; self._displayed_inds = []
         self._sec_tree.delete(*self._sec_tree.get_children())
         self._ind_tree.delete(*self._ind_tree.get_children())
         threading.Thread(target=self._worker, daemon=True).start()
@@ -553,13 +586,7 @@ class ChartsMazeGUI(tk.Tk):
         self._sectors    = sectors
         self._industries = all_inds
 
-        self._sec_tree.delete(*self._sec_tree.get_children())
-        for s in sectors:
-            quad = s.quadrant.value if s.quadrant else "—"
-            self._sec_tree.insert("", "end",
-                tags=(quad if quad in _QUAD_FG else "dim",),
-                values=(s.name, quad, _fmt(s.rs_ratio), _fmt(s.rs_momentum), _fmt(s.rrg_score())),
-            )
+        self._populate_sector_tree(sectors)
 
         leading = sum(1 for s in sectors if s.quadrant and s.quadrant.value == "Leading")
         self._status_var.set(f"{len(sectors)} sectors  •  {leading} Leading")
@@ -569,10 +596,12 @@ class ChartsMazeGUI(tk.Tk):
         self._redraw_tab_charts()
         self.after(150, self._sync_chart_sizes)
 
+        # Select first real sector (index 1, after the "ALL" row)
         ch = self._sec_tree.get_children()
-        if ch:
-            self._sec_tree.selection_set(ch[0])
-            self._sec_tree.focus(ch[0])
+        target = ch[1] if len(ch) > 1 else (ch[0] if ch else None)
+        if target:
+            self._sec_tree.selection_set(target)
+            self._sec_tree.focus(target)
 
     def _on_error(self, msg: str) -> None:
         self._status_var.set(f"Error: {msg[:120]}")
@@ -582,48 +611,40 @@ class ChartsMazeGUI(tk.Tk):
         sel = self._sec_tree.selection()
         if not sel:
             return
-        sector = self._sectors[self._sec_tree.index(sel[0])]
-        inds   = self._industries.get(sector.name, [])
-
-        self._ind_tree.delete(*self._ind_tree.get_children())
-        for i in inds:
-            quad = i.quadrant.value if i.quadrant else "—"
-            hi   = _fmt(i.from_52w_high_pct, suffix="%") if i.from_52w_high_pct is not None else "—"
-            self._ind_tree.insert("", "end",
-                tags=(quad if quad in _QUAD_FG else "dim",),
-                values=(
-                    i.name, quad,
-                    _fmt(i.rs_ratio), _fmt(i.rs_momentum),
-                    _fmt(i.trend_score(), 0),
-                    i.rank_1w  if i.rank_1w  is not None else "—",
-                    i.rank_1m  if i.rank_1m  is not None else "—",
-                    i.rank_3m  if i.rank_3m  is not None else "—",
-                    _fmt(i.performance_1w, suffix="%"),
-                    _fmt(i.performance_1m, suffix="%"),
-                    _fmt(i.performance_3m, suffix="%"),
-                    hi,
-                ),
+        iid = sel[0]
+        if iid == "__ALL__":
+            seen: set[str] = set()
+            inds: list = []
+            for inds_list in self._industries.values():
+                for i in inds_list:
+                    if i.name not in seen:
+                        seen.add(i.name)
+                        inds.append(i)
+            self._populate_ind_tree(inds)
+            self._score_bar.config(
+                text=f"All sectors  •  {len(self._displayed_inds)} industries"
             )
-
-        self._score_bar.config(
-            text=(f"{sector.name}  •  RRG score {_fmt(sector.rrg_score())}  "
-                  f"•  ind avg trend {_fmt(sector.industry_avg_trend, 0)}  "
-                  f"•  {len(inds)} industries")
-        )
+        else:
+            sector_name = iid[4:]  # strip leading "sec_"
+            sector = next((s for s in self._sectors if s.name == sector_name), None)
+            if not sector:
+                return
+            inds = self._industries.get(sector.name, [])
+            self._populate_ind_tree(inds)
+            self._score_bar.config(
+                text=(f"{sector.name}  •  RRG score {_fmt(sector.rrg_score())}  "
+                      f"•  ind avg trend {_fmt(sector.industry_avg_trend, 0)}  "
+                      f"•  {len(inds)} industries")
+            )
 
     def _on_industry_select(self, _event: tk.Event) -> None:
         sel = self._ind_tree.selection()
         if not sel:
             return
-        idx     = self._ind_tree.index(sel[0])
-        sec_sel = self._sec_tree.selection()
-        if not sec_sel:
+        idx = self._ind_tree.index(sel[0])
+        if idx >= len(self._displayed_inds):
             return
-        sector = self._sectors[self._sec_tree.index(sec_sel[0])]
-        inds   = self._industries.get(sector.name, [])
-        if idx >= len(inds):
-            return
-        ind = inds[idx]
+        ind = self._displayed_inds[idx]
 
         self._score_bar.config(
             text=(
@@ -639,6 +660,75 @@ class ChartsMazeGUI(tk.Tk):
         if _HAS_MPL and self._detail_fig is not None and self._detail_canvas is not None:
             _draw_detail_chart(self._detail_fig, ind)
             self._detail_canvas.draw()
+            self.after(80, self._sync_chart_sizes)
+
+    # ── sort / populate helpers ────────────────────────────────────────────────
+
+    def _populate_sector_tree(self, sectors: list) -> None:
+        col, rev = self._sec_sort
+        key = _SEC_SORT_KEYS.get(col)
+        ordered = sorted(sectors, key=key, reverse=rev) if key else sectors
+        self._sec_tree.delete(*self._sec_tree.get_children())
+        self._sec_tree.insert("", "end", iid="__ALL__",
+            tags=("all",),
+            values=("▶  ALL SECTORS", "—", "—", "—", "—"))
+        for s in ordered:
+            quad = s.quadrant.value if s.quadrant else "—"
+            self._sec_tree.insert("", "end", iid=f"sec_{s.name}",
+                tags=(quad if quad in _QUAD_FG else "dim",),
+                values=(s.name, quad, _fmt(s.rs_ratio), _fmt(s.rs_momentum), _fmt(s.rrg_score())),
+            )
+        for c in _SEC_COLS:
+            ind = (" ▼" if rev else " ▲") if c == col else ""
+            self._sec_tree.heading(c, text=c + ind,
+                                   command=lambda cc=c: self._sort_sector(cc))
+
+    def _populate_ind_tree(self, inds: list) -> None:
+        col, rev = self._ind_sort
+        key = _IND_SORT_KEYS.get(col)
+        ordered = sorted(inds, key=key, reverse=rev) if key else list(inds)
+        self._displayed_inds = ordered
+        self._ind_tree.delete(*self._ind_tree.get_children())
+        for i in ordered:
+            quad = i.quadrant.value if i.quadrant else "—"
+            hi   = _fmt(i.from_52w_high_pct, suffix="%") if i.from_52w_high_pct is not None else "—"
+            self._ind_tree.insert("", "end",
+                tags=(quad if quad in _QUAD_FG else "dim",),
+                values=(
+                    i.name, quad,
+                    _fmt(i.rs_ratio), _fmt(i.rs_momentum),
+                    _fmt(i.trend_score(), 0),
+                    i.rank_1w if i.rank_1w is not None else "—",
+                    i.rank_1m if i.rank_1m is not None else "—",
+                    i.rank_3m if i.rank_3m is not None else "—",
+                    _fmt(i.performance_1w, suffix="%"),
+                    _fmt(i.performance_1m, suffix="%"),
+                    _fmt(i.performance_3m, suffix="%"),
+                    hi,
+                ),
+            )
+        for c in _IND_COLS:
+            ind = (" ▼" if rev else " ▲") if c == col else ""
+            self._ind_tree.heading(c, text=c + ind,
+                                   command=lambda cc=c: self._sort_industry(cc))
+
+    def _sort_sector(self, col: str) -> None:
+        cur_col, cur_rev = self._sec_sort
+        self._sec_sort = (col, not cur_rev if col == cur_col else True)
+        # remember current selection iid, restore after repopulate
+        sel = self._sec_tree.selection()
+        self._populate_sector_tree(self._sectors)
+        if sel:
+            try:
+                self._sec_tree.selection_set(sel[0])
+                self._sec_tree.focus(sel[0])
+            except tk.TclError:
+                pass
+
+    def _sort_industry(self, col: str) -> None:
+        cur_col, cur_rev = self._ind_sort
+        self._ind_sort = (col, not cur_rev if col == cur_col else True)
+        self._populate_ind_tree(self._displayed_inds)
 
     # ── charts ─────────────────────────────────────────────────────────────────
 
