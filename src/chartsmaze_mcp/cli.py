@@ -51,7 +51,7 @@ async def _cmd_industries(args: argparse.Namespace) -> None:
     async with ChartsMazeClient(session_cookie=os.environ.get("CHARTSMAZE_SESSION")) as cm:
         industries = await cm.get_industry_analysis(args.sector)
 
-    ranked = sorted(industries, key=lambda i: i.performance_1d or 0.0, reverse=True)
+    ranked = sorted(industries, key=lambda i: i.trend_score(), reverse=True)
     _print([i.model_dump() for i in ranked])
 
 
@@ -150,7 +150,7 @@ async def _cmd_run(args: argparse.Namespace) -> None:
         industries_by_sector: dict[str, list[str]] = {}
         for sector in top_sectors:
             inds = await cm.get_industry_analysis(sector)
-            inds_sorted = sorted(inds, key=lambda i: i.performance_1d or 0.0, reverse=True)
+            inds_sorted = sorted(inds, key=lambda i: i.trend_score(), reverse=True)
             industries_by_sector[sector] = [i.name for i in inds_sorted[:3]]
         summary["top_industries"] = industries_by_sector
 

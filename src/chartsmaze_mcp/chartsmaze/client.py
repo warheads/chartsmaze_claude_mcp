@@ -108,16 +108,16 @@ class ChartsMazeClient:
 
     async def get_sector_analysis(self) -> list[SectorData]:
         """
-        Return sectors ranked by a composite score:
-          • RRG quadrant from the most recent daily RS_Ratio / RS_Momentum
-          • 1-day performance aggregated from constituent industries
+        Return sectors with multi-factor scoring data:
+          • RRG quadrant + RS-Ratio / RS-Momentum (from rrg_daily.gz)
+          • 1D/1M/3M performance aggregated from constituent industries
+          • Average industry trend score (rank improvement + perf consistency)
         """
         await self._ensure_data()
         industry_rows = self._parsed.get("industry", [])
         rs_rows       = self._parsed.get("rs_filter", [])
         rrg_rows      = self._parsed.get("rrg_daily", [])
 
-        # Build sector → list[industry row] map.
         industry_to_sector: dict[str, str] = {}
         for r in rs_rows:
             ind = r.get(_COL_INDUSTRY, "").strip()
@@ -125,39 +125,66 @@ class ChartsMazeClient:
             if ind and sec:
                 industry_to_sector[ind] = sec
 
-        # Aggregate industry perf into sectors.
-        sector_perf: dict[str, list[float]] = {}
+        rrg_latest = _parse_rrg_latest(rrg_rows, industry_to_sector)
+
+        # Build per-sector aggregates from industry rows.
+        sector_p1d:    dict[str, list[float]] = {}
+        sector_p1m:    dict[str, list[float]] = {}
+        sector_p3m:    dict[str, list[float]] = {}
+        sector_trends: dict[str, list[float]] = {}
+
         for row in industry_rows:
             ind = row.get("Basic Industry", "").strip()
             sec = industry_to_sector.get(ind, "")
             if not sec:
                 continue
-            p1d = _flt(row.get("Industry 1D Performance(%)", ""))
-            if p1d is not None:
-                sector_perf.setdefault(sec, []).append(p1d)
-
-        # Parse RRG: latest date for each sector/index.
-        rrg_latest = _parse_rrg_latest(rrg_rows, industry_to_sector)
+            rrg = rrg_latest.get(ind, {})
+            ind_obj = IndustryData(
+                name=ind,
+                sector=sec,
+                performance_1d=_flt(row.get("Industry 1D Performance(%)")),
+                performance_1w=_flt(row.get("Industry 1W Performance(%)")),
+                performance_1m=_flt(row.get("Industry 1M Performance(%)")),
+                performance_3m=_flt(row.get("Industry 3M Performance(%)")),
+                rank_1w=_int(row.get("Industry 1W Rank")),
+                rank_1m=_int(row.get("Industry 1M Rank")),
+                rank_3m=_int(row.get("Industry 3M Rank")),
+                stock_count=_int(row.get("Number of Stocks")),
+                market_cap=_flt(row.get("Group Market Cap")),
+                quadrant=rrg.get("quadrant"),
+                rs_ratio=rrg.get("rs_ratio"),
+                rs_momentum=rrg.get("rs_momentum"),
+            )
+            sector_trends.setdefault(sec, []).append(ind_obj.trend_score())
+            if ind_obj.performance_1d is not None:
+                sector_p1d.setdefault(sec, []).append(ind_obj.performance_1d)
+            if ind_obj.performance_1m is not None:
+                sector_p1m.setdefault(sec, []).append(ind_obj.performance_1m)
+            if ind_obj.performance_3m is not None:
+                sector_p3m.setdefault(sec, []).append(ind_obj.performance_3m)
 
         sectors: list[SectorData] = []
-        for sec, perfs in sector_perf.items():
-            avg_1d = sum(perfs) / len(perfs) if perfs else None
+        for sec in sector_trends:
+            p1d = sector_p1d.get(sec, [])
+            p1m = sector_p1m.get(sec, [])
+            p3m = sector_p3m.get(sec, [])
+            trends = sector_trends[sec]
             rrg = rrg_latest.get(sec, {})
-            rs_ratio   = rrg.get("rs_ratio")
-            rs_momentum = rrg.get("rs_momentum")
-            quadrant   = rrg.get("quadrant")
             sectors.append(SectorData(
                 name=sec,
-                performance_1d=avg_1d,
-                quadrant=quadrant,
-                rs_ratio=rs_ratio,
-                rs_momentum=rs_momentum,
+                performance_1d=sum(p1d) / len(p1d) if p1d else None,
+                performance_1m=sum(p1m) / len(p1m) if p1m else None,
+                performance_3m=sum(p3m) / len(p3m) if p3m else None,
+                quadrant=rrg.get("quadrant"),
+                rs_ratio=rrg.get("rs_ratio"),
+                rs_momentum=rrg.get("rs_momentum"),
+                industry_avg_trend=sum(trends) / len(trends),
             ))
 
         return sectors
 
     async def get_industry_analysis(self, sector: str) -> list[IndustryData]:
-        """Return industries, optionally filtered to *sector*."""
+        """Return industries filtered to *sector*, sorted by multi-factor trend score."""
         await self._ensure_data()
         industry_rows = self._parsed.get("industry", [])
         rs_rows       = self._parsed.get("rs_filter", [])
@@ -172,22 +199,29 @@ class ChartsMazeClient:
 
         industries: list[IndustryData] = []
         for row in industry_rows:
-            ind    = row.get("Basic Industry", "").strip()
+            ind     = row.get("Basic Industry", "").strip()
             ind_sec = industry_to_sector.get(ind, "")
             if sector and ind_sec and sector.lower() not in ind_sec.lower():
                 continue
-            rrg    = rrg_latest.get(ind, {})
+            rrg = rrg_latest.get(ind, {})
             industries.append(IndustryData(
                 name=ind,
                 sector=ind_sec,
                 performance_1d=_flt(row.get("Industry 1D Performance(%)")),
-                performance_5d=_flt(row.get("Industry 1W Performance(%)")),
+                performance_1w=_flt(row.get("Industry 1W Performance(%)")),
+                performance_1m=_flt(row.get("Industry 1M Performance(%)")),
+                performance_3m=_flt(row.get("Industry 3M Performance(%)")),
+                rank_1w=_int(row.get("Industry 1W Rank")),
+                rank_1m=_int(row.get("Industry 1M Rank")),
+                rank_3m=_int(row.get("Industry 3M Rank")),
+                stock_count=_int(row.get("Number of Stocks")),
+                market_cap=_flt(row.get("Group Market Cap")),
                 quadrant=rrg.get("quadrant"),
                 rs_ratio=rrg.get("rs_ratio"),
                 rs_momentum=rrg.get("rs_momentum"),
             ))
 
-        return sorted(industries, key=lambda i: i.performance_1d or 0.0, reverse=True)
+        return sorted(industries, key=lambda i: i.trend_score(), reverse=True)
 
     async def get_rrg_leaders(self) -> list[dict]:
         """Return sectors/industries currently in the Leading RRG quadrant."""
@@ -369,6 +403,11 @@ def _flt(v: Any) -> Optional[float]:
         return float(str(v).replace(",", "").replace("%", "").strip())
     except (ValueError, TypeError):
         return None
+
+
+def _int(v: Any) -> Optional[int]:
+    f = _flt(v)
+    return int(f) if f is not None else None
 
 
 

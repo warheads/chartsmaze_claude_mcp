@@ -110,7 +110,7 @@ async def analyze_industries(
     if not industries:
         return _fmt({"error": f"No industry data for sector '{sector}'."})
 
-    ranked = sorted(industries, key=lambda i: i.performance_1d or 0.0, reverse=True)
+    ranked = sorted(industries, key=lambda i: i.trend_score(), reverse=True)
     return _fmt([i.model_dump() for i in ranked])
 
 
@@ -317,7 +317,7 @@ async def run_full_workflow(
         industries_by_sector: dict[str, list[str]] = {}
         for sector in top_sectors:
             inds = await cm.get_industry_analysis(sector)
-            inds_sorted = sorted(inds, key=lambda i: i.performance_1d or 0.0, reverse=True)
+            inds_sorted = sorted(inds, key=lambda i: i.trend_score(), reverse=True)
             top_3 = [i.name for i in inds_sorted[:3]]
             industries_by_sector[sector] = top_3
             top_industries.extend(top_3)
