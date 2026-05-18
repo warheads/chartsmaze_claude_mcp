@@ -1,5 +1,5 @@
 """
-ChartsMaze AMOLED GUI — sector / industry tables + detachable chart window.
+ChartsMaze AMOLED GUI — tables + embedded rank-vs-performance charts.
 
 Usage:
     chartsmaze-gui
@@ -116,13 +116,13 @@ def _styled_tree(parent: tk.Widget, columns: list[str], widths: list[int]) -> tt
     return tree
 
 
-def _draw_period_chart(fig: "plt.Figure", pool: list, period: str,
-                       get_rank, get_perf) -> None:
+def _draw_chart(fig: "plt.Figure", pool: list, period: str,
+                get_rank, get_perf) -> None:
     """Render one rank-vs-performance chart into *fig* (clears first)."""
     from .chartsmaze.models import RRGQuadrant
 
-    fig.clear()
     plt.rcParams.update(_MPL_RC)
+    fig.clear()
 
     ax = fig.add_subplot(111)
     ax.set_facecolor(SURFACE)
@@ -134,7 +134,7 @@ def _draw_period_chart(fig: "plt.Figure", pool: list, period: str,
         for i in pool
         if get_rank(i) is not None and get_perf(i) is not None
     ]
-    valid.sort(key=lambda t: t[1])   # sort ascending by rank (worst → best)
+    valid.sort(key=lambda t: t[1])   # ascending rank → left = best, right = worst
 
     if not valid:
         ax.set_title(f"{period}  —  no data", color=FG2)
@@ -149,11 +149,10 @@ def _draw_period_chart(fig: "plt.Figure", pool: list, period: str,
     ]
     labels = [t[0].name[:18] for t in valid]
 
-    # Left Y: rank (inverted)
+    # Left Y: rank — low value at bottom, high value at top (normal direction)
     ax.plot(xs, ranks, color=ACCENT, linewidth=2.0, marker="o",
-            markersize=4, zorder=3, label="Rank")
-    ax.invert_yaxis()
-    ax.set_ylabel("Rank  (↑ = better)", color=ACCENT, fontsize=9)
+            markersize=4, zorder=3)
+    ax.set_ylabel("Rank  (low = best)", color=ACCENT, fontsize=9)
     ax.tick_params(axis="y", colors=ACCENT)
     ax.grid(axis="y", color=BORDER, linewidth=0.5)
 
@@ -163,7 +162,7 @@ def _draw_period_chart(fig: "plt.Figure", pool: list, period: str,
     for spine in ax2.spines.values():
         spine.set_edgecolor(BORDER)
     ax2.plot(xs, perfs, color=FG2, linewidth=1.2, linestyle="--", zorder=2, alpha=0.7)
-    ax2.scatter(xs, perfs, color=colors, s=50, zorder=4)
+    ax2.scatter(xs, perfs, color=colors, s=55, zorder=4)
     ax2.axhline(0, color=BORDER, linewidth=0.8, zorder=1)
     ax2.set_ylabel("Performance %", color=FG2, fontsize=9)
     ax2.tick_params(axis="y", colors=FG2)
@@ -173,136 +172,40 @@ def _draw_period_chart(fig: "plt.Figure", pool: list, period: str,
     ax.tick_params(axis="x", colors=FG2)
     ax.set_xlim(-0.5, len(xs) - 0.5)
 
-    leading_n  = sum(1 for t in valid if t[0].quadrant == RRGQuadrant.LEADING)
+    leading_n   = sum(1 for t in valid if t[0].quadrant == RRGQuadrant.LEADING)
     improving_n = len(valid) - leading_n
     ax.set_title(
         f"{period}  Rank vs Performance  "
         f"({leading_n} Leading  {improving_n} Improving)  —  MCW",
         color=FG, fontsize=11,
     )
-
     fig.tight_layout(pad=1.8)
 
 
-# ── single-chart popup ─────────────────────────────────────────────────────────
+# ── single-chart popup (⤢ Expand) ─────────────────────────────────────────────
 
 class SingleChartWindow(tk.Toplevel):
-    """Full-screen view of one period chart."""
-
     def __init__(self, parent: tk.Widget, pool: list,
                  period: str, get_rank, get_perf) -> None:
         super().__init__(parent)
-        self.title(f"ChartsMaze — {period} Rank vs Performance")
+        self.title(f"ChartsMaze — {period}")
         self.configure(bg=BG)
         self.geometry("1280x720")
-        self.state("zoomed") if os.name == "nt" else self.attributes("-zoomed", True)
+        try:
+            self.state("zoomed")
+        except tk.TclError:
+            self.attributes("-zoomed", True)
 
         if not _HAS_MPL:
-            tk.Label(self, text="matplotlib not installed", bg=BG, fg=RED,
-                     font=_FONT).pack(expand=True)
+            tk.Label(self, text="pip install matplotlib", bg=BG, fg=RED, font=_FONT).pack(expand=True)
             return
 
         fig = plt.Figure(facecolor=BG)
-        _draw_period_chart(fig, pool, period, get_rank, get_perf)
-
+        _draw_chart(fig, pool, period, get_rank, get_perf)
         canvas = FigureCanvasTkAgg(fig, master=self)
         canvas.get_tk_widget().configure(bg=BG, highlightthickness=0)
         canvas.get_tk_widget().pack(fill="both", expand=True)
         canvas.draw()
-
-
-# ── charts notebook window ─────────────────────────────────────────────────────
-
-class ChartsWindow(tk.Toplevel):
-    """
-    Separate window with a ttk.Notebook: one tab per period (1W / 1M / 3M).
-
-    Each tab shows a full chart and an "⤢ Expand" button to open that
-    chart in its own maximised window.
-    """
-
-    def __init__(self, parent: tk.Widget) -> None:
-        super().__init__(parent)
-        self.title("ChartsMaze — Rank vs Performance")
-        self.configure(bg=BG)
-        self.geometry("1280x680")
-        self.protocol("WM_DELETE_WINDOW", self.withdraw)   # hide, don't destroy
-
-        self._pool: list = []
-        self._figs:    list["plt.Figure"] = []
-        self._canvases: list = []
-
-        self._build()
-
-    def _build(self) -> None:
-        # header
-        hdr = tk.Frame(self, bg=BG, pady=8)
-        hdr.pack(fill="x", padx=14)
-        tk.Label(hdr, text="Rank vs Performance  —  Leading & Improving  (MCW)",
-                 bg=BG, fg=FG2, font=_FONT_SM).pack(side="left")
-        for quad, color in [("Leading", GREEN), ("Improving", YELLOW)]:
-            tk.Label(hdr, text="●", bg=BG, fg=color, font=_FONT_SM).pack(side="right", padx=(0, 2))
-            tk.Label(hdr, text=quad, bg=BG, fg=FG2, font=_FONT_SM).pack(side="right")
-        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
-
-        # style the notebook tabs
-        s = ttk.Style()
-        s.theme_use("default")
-        s.configure("Amoled.TNotebook", background=BG, borderwidth=0)
-        s.configure("Amoled.TNotebook.Tab",
-            background=CARD, foreground=FG2,
-            padding=[16, 6], font=_FONT_BOLD,
-        )
-        s.map("Amoled.TNotebook.Tab",
-            background=[("selected", BORDER)],
-            foreground=[("selected", ACCENT)],
-        )
-
-        nb = ttk.Notebook(self, style="Amoled.TNotebook")
-        nb.pack(fill="both", expand=True, padx=0, pady=0)
-        self._nb = nb
-
-        if not _HAS_MPL:
-            f = tk.Frame(nb, bg=BG)
-            nb.add(f, text="Charts")
-            tk.Label(f, text="Install matplotlib:  pip install matplotlib",
-                     bg=BG, fg=RED, font=_FONT).pack(expand=True)
-            return
-
-        for period, get_rank, get_perf in _PERIODS:
-            tab = tk.Frame(nb, bg=BG)
-            nb.add(tab, text=f"   {period}   ")
-
-            # Per-tab toolbar
-            bar = tk.Frame(tab, bg=BG, pady=4)
-            bar.pack(fill="x", padx=10)
-            tk.Button(
-                bar, text="⤢  Expand in new window",
-                bg=CARD, fg=ACCENT, activebackground=BORDER, activeforeground=ACCENT,
-                relief="flat", font=_FONT_SM, padx=10, pady=3, cursor="hand2",
-                command=lambda p=period, gr=get_rank, gp=get_perf: self._expand(p, gr, gp),
-            ).pack(side="right")
-
-            fig = plt.Figure(facecolor=BG)
-            canvas = FigureCanvasTkAgg(fig, master=tab)
-            canvas.get_tk_widget().configure(bg=BG, highlightthickness=0)
-            canvas.get_tk_widget().pack(fill="both", expand=True)
-
-            self._figs.append(fig)
-            self._canvases.append(canvas)
-
-    def update(self, pool: list) -> None:  # type: ignore[override]
-        self._pool = pool
-        if not _HAS_MPL:
-            return
-        for fig, canvas, (period, get_rank, get_perf) in zip(
-            self._figs, self._canvases, _PERIODS
-        ):
-            _draw_period_chart(fig, pool, period, get_rank, get_perf)
-            canvas.draw()
-
-    def _expand(self, period: str, get_rank, get_perf) -> None:
-        SingleChartWindow(self, self._pool, period, get_rank, get_perf)
 
 
 # ── main window ────────────────────────────────────────────────────────────────
@@ -312,20 +215,31 @@ class ChartsMazeGUI(tk.Tk):
         super().__init__()
         self.title("ChartsMaze")
         self.configure(bg=BG)
-        self.geometry("1280x700")
-        self.minsize(900, 500)
+        self.geometry("1400x860")
 
         self._sectors:    list = []
         self._industries: dict[str, list] = {}
-        self._charts_win: Optional[ChartsWindow] = None
+        self._chart_figs:    list = []
+        self._chart_canvases: list = []
+        self._pool: list = []
 
         self._build()
-        self.after(100, self._fetch)
+
+        # Maximise on startup
+        self.update_idletasks()
+        try:
+            self.state("zoomed")
+        except tk.TclError:
+            self.attributes("-zoomed", True)
+
+        # Set sash after maximise geometry is resolved
+        self.after(150, self._init_sash)
+        self.after(200, self._fetch)
 
     # ── layout ─────────────────────────────────────────────────────────────────
 
     def _build(self) -> None:
-        # header
+        # ---- header
         hdr = tk.Frame(self, bg=BG, pady=10)
         hdr.pack(fill="x", padx=16)
         tk.Label(hdr, text="ChartsMaze", bg=BG, fg=ACCENT, font=_FONT_H).pack(side="left")
@@ -333,14 +247,6 @@ class ChartsMazeGUI(tk.Tk):
         tk.Label(hdr, textvariable=self._status_var, bg=BG, fg=FG2, font=_FONT_SM).pack(
             side="left", padx=14,
         )
-        self._chart_btn = tk.Button(
-            hdr, text="📊  Charts", bg=CARD, fg=ACCENT,
-            activebackground=BORDER, activeforeground=ACCENT,
-            relief="flat", font=_FONT_BOLD, padx=12, pady=4,
-            cursor="hand2", command=self._show_charts,
-            state="disabled",
-        )
-        self._chart_btn.pack(side="right", padx=(6, 0))
         self._btn = tk.Button(
             hdr, text="⟳  Refresh", bg=CARD, fg=ACCENT,
             activebackground=BORDER, activeforeground=ACCENT,
@@ -348,53 +254,128 @@ class ChartsMazeGUI(tk.Tk):
             cursor="hand2", command=self._fetch,
         )
         self._btn.pack(side="right")
-
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
 
-        # body: sectors | industries
-        body = tk.Frame(self, bg=BG)
-        body.pack(fill="both", expand=True, padx=12, pady=(8, 0))
-
-        # sector panel (fixed width)
-        sec_pane = tk.Frame(body, bg=BG, width=390)
-        sec_pane.pack(side="left", fill="y")
-        sec_pane.pack_propagate(False)
-        tk.Label(sec_pane, text="SECTORS", bg=BG, fg=FG2, font=_FONT_SM).pack(anchor="w", pady=(0, 4))
-        self._sec_tree = _styled_tree(
-            sec_pane,
-            columns=["Sector",  "Quad",  "RS",   "Mom",  "Score"],
-            widths= [160,        82,      52,     52,     60],
+        # ---- vertical PanedWindow: tables top, charts bottom
+        self._paned = tk.PanedWindow(
+            self, orient="vertical", bg=BG,
+            sashwidth=6, sashrelief="flat", sashpad=0,
         )
-        self._sec_tree.bind("<<TreeviewSelect>>", self._on_sector_select)
+        self._paned.pack(fill="both", expand=True, padx=10, pady=(8, 0))
 
-        tk.Frame(body, bg=BORDER, width=1).pack(side="left", fill="y", padx=6)
+        # top pane: sector + industry tables
+        tables = tk.Frame(self._paned, bg=BG)
+        self._paned.add(tables, stretch="always", minsize=160)
+        self._build_sector_panel(tables)
+        tk.Frame(tables, bg=BORDER, width=1).pack(side="left", fill="y", padx=6)
+        self._build_industry_panel(tables)
 
-        # industry panel (expands)
-        ind_pane = tk.Frame(body, bg=BG)
-        ind_pane.pack(side="left", fill="both", expand=True)
-        tk.Label(ind_pane, text="INDUSTRIES", bg=BG, fg=FG2, font=_FONT_SM).pack(anchor="w", pady=(0, 4))
-        self._ind_tree = _styled_tree(
-            ind_pane,
-            columns=["Industry", "Quad",  "RS",  "Mom",  "Trend", "R1W", "R1M", "R3M", "P1W%", "P1M%", "P3M%"],
-            widths= [180,         82,      52,    52,     60,      42,    42,    42,    60,     60,     60],
-        )
-        self._ind_tree.bind("<<TreeviewSelect>>", self._on_industry_select)
+        # bottom pane: 3-tab chart notebook
+        charts = tk.Frame(self._paned, bg=BG)
+        self._paned.add(charts, stretch="always", minsize=200)
+        self._build_charts(charts)
 
-        # status bar
+        # ---- status bar
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
         self._score_bar = tk.Label(
             self, text="", bg=BG, fg=FG2, font=_FONT_SM, anchor="w", pady=4,
         )
         self._score_bar.pack(fill="x", padx=16)
 
+    def _init_sash(self) -> None:
+        """Place sash at ~42 % of window height once geometry is resolved."""
+        h = self.winfo_height()
+        if h > 100:
+            self._paned.sash_place(0, 0, int(h * 0.42))
+
+    def _build_sector_panel(self, parent: tk.Widget) -> None:
+        pane = tk.Frame(parent, bg=BG, width=390)
+        pane.pack(side="left", fill="y")
+        pane.pack_propagate(False)
+        tk.Label(pane, text="SECTORS", bg=BG, fg=FG2, font=_FONT_SM).pack(anchor="w", pady=(0, 4))
+        self._sec_tree = _styled_tree(
+            pane,
+            columns=["Sector",  "Quad",  "RS",   "Mom",  "Score"],
+            widths= [160,        82,      52,     52,     60],
+        )
+        self._sec_tree.bind("<<TreeviewSelect>>", self._on_sector_select)
+
+    def _build_industry_panel(self, parent: tk.Widget) -> None:
+        pane = tk.Frame(parent, bg=BG)
+        pane.pack(side="left", fill="both", expand=True)
+        tk.Label(pane, text="INDUSTRIES", bg=BG, fg=FG2, font=_FONT_SM).pack(anchor="w", pady=(0, 4))
+        self._ind_tree = _styled_tree(
+            pane,
+            columns=["Industry", "Quad",  "RS",  "Mom",  "Trend", "R1W", "R1M", "R3M", "P1W%", "P1M%", "P3M%"],
+            widths= [180,         82,      52,    52,     60,      42,    42,    42,    60,     60,     60],
+        )
+        self._ind_tree.bind("<<TreeviewSelect>>", self._on_industry_select)
+
+    def _build_charts(self, parent: tk.Widget) -> None:
+        # label row
+        lbl = tk.Frame(parent, bg=BG)
+        lbl.pack(fill="x")
+        tk.Label(
+            lbl,
+            text="RANK vs PERFORMANCE  —  Leading & Improving  (MCW)",
+            bg=BG, fg=FG2, font=_FONT_SM,
+        ).pack(side="left", pady=(0, 4))
+        for quad, color in [("Leading", GREEN), ("Improving", YELLOW)]:
+            tk.Label(lbl, text="●", bg=BG, fg=color, font=_FONT_SM).pack(side="right", padx=(0, 2))
+            tk.Label(lbl, text=quad, bg=BG, fg=FG2, font=_FONT_SM).pack(side="right")
+
+        if not _HAS_MPL:
+            tk.Label(parent, text="pip install matplotlib", bg=BG, fg=RED, font=_FONT).pack(expand=True)
+            return
+
+        # tab style
+        s = ttk.Style()
+        s.theme_use("default")
+        s.configure("Amoled.TNotebook", background=BG, borderwidth=0)
+        s.configure("Amoled.TNotebook.Tab",
+            background=CARD, foreground=FG2, padding=[18, 6], font=_FONT_BOLD,
+        )
+        s.map("Amoled.TNotebook.Tab",
+            background=[("selected", BORDER)],
+            foreground=[("selected", ACCENT)],
+        )
+
+        nb = ttk.Notebook(parent, style="Amoled.TNotebook")
+        nb.pack(fill="both", expand=True)
+
+        self._chart_figs.clear()
+        self._chart_canvases.clear()
+
+        for period, get_rank, get_perf in _PERIODS:
+            tab = tk.Frame(nb, bg=BG)
+            nb.add(tab, text=f"   {period}   ")
+
+            # toolbar: expand button on LEFT
+            bar = tk.Frame(tab, bg=BG, pady=3)
+            bar.pack(fill="x", padx=10)
+            tk.Button(
+                bar, text="⤢  Expand",
+                bg=CARD, fg=ACCENT, activebackground=BORDER, activeforeground=ACCENT,
+                relief="flat", font=_FONT_SM, padx=10, pady=3, cursor="hand2",
+                command=lambda p=period, gr=get_rank, gp=get_perf: self._expand(p, gr, gp),
+            ).pack(side="left")
+
+            fig = plt.Figure(facecolor=BG)
+            canvas = FigureCanvasTkAgg(fig, master=tab)
+            canvas.get_tk_widget().configure(bg=BG, highlightthickness=0)
+            canvas.get_tk_widget().pack(fill="both", expand=True)
+
+            self._chart_figs.append(fig)
+            self._chart_canvases.append(canvas)
+
     # ── data loading ───────────────────────────────────────────────────────────
 
     def _fetch(self) -> None:
         self._btn.config(state="disabled")
-        self._chart_btn.config(state="disabled")
         self._status_var.set("Loading data — this may take ~30 s…")
         self._sectors = []
         self._industries = {}
+        self._pool = []
         self._sec_tree.delete(*self._sec_tree.get_children())
         self._ind_tree.delete(*self._ind_tree.get_children())
         threading.Thread(target=self._worker, daemon=True).start()
@@ -437,10 +418,9 @@ class ChartsMazeGUI(tk.Tk):
         leading = sum(1 for s in sectors if s.quadrant and s.quadrant.value == "Leading")
         self._status_var.set(f"{len(sectors)} sectors  •  {leading} Leading")
         self._btn.config(state="normal")
-        self._chart_btn.config(state="normal")
 
-        # push data into charts window if already open
-        self._push_charts()
+        self._pool = self._collect_pool()
+        self._redraw_charts()
 
         children = self._sec_tree.get_children()
         if children:
@@ -507,10 +487,9 @@ class ChartsMazeGUI(tk.Tk):
             )
         )
 
-    # ── charts window ──────────────────────────────────────────────────────────
+    # ── charts ─────────────────────────────────────────────────────────────────
 
     def _collect_pool(self) -> list:
-        """Unique Leading + Improving industries across all sectors."""
         from .chartsmaze.models import RRGQuadrant
         seen: set[str] = set()
         pool: list = []
@@ -524,25 +503,17 @@ class ChartsMazeGUI(tk.Tk):
                     pool.append(i)
         return pool
 
-    def _push_charts(self) -> None:
-        """Send current data to charts window if it exists."""
-        if self._charts_win is not None:
-            try:
-                if self._charts_win.winfo_exists():
-                    self._charts_win.update(self._collect_pool())
-            except tk.TclError:
-                self._charts_win = None
+    def _redraw_charts(self) -> None:
+        if not _HAS_MPL:
+            return
+        for fig, canvas, (period, get_rank, get_perf) in zip(
+            self._chart_figs, self._chart_canvases, _PERIODS
+        ):
+            _draw_chart(fig, self._pool, period, get_rank, get_perf)
+            canvas.draw()
 
-    def _show_charts(self) -> None:
-        """Open (or raise) the charts window and populate with current data."""
-        if self._charts_win is None or not self._charts_win.winfo_exists():
-            self._charts_win = ChartsWindow(self)
-        else:
-            self._charts_win.deiconify()
-            self._charts_win.lift()
-
-        if self._industries:
-            self._charts_win.update(self._collect_pool())
+    def _expand(self, period: str, get_rank, get_perf) -> None:
+        SingleChartWindow(self, self._pool, period, get_rank, get_perf)
 
 
 # ── entry point ────────────────────────────────────────────────────────────────
