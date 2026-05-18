@@ -102,11 +102,21 @@ async def _cmd_tv_discover(args: argparse.Namespace) -> None:
         print("ERROR: TRADINGVIEW_SESSION not set in .env", file=sys.stderr)
         sys.exit(1)
 
+    interactive = getattr(args, "interactive", False)
     async with TradingViewClient(
         session_id=tv_session,
         session_sign=os.environ.get("TRADINGVIEW_SESSION_SIGN"),
+        headless=not interactive,
     ) as tv:
-        calls = await tv.discover_api_calls(args.url)
+        calls = await tv.discover_api_calls(args.url, interactive=interactive)
+
+    # For interactive mode highlight write operations prominently.
+    if interactive:
+        writes = [c for c in calls if c["method"] in ("POST", "PUT", "PATCH", "DELETE")]
+        print(f"\n[tv-discover] {len(calls)} total calls, {len(writes)} write (POST/PUT/PATCH/DELETE):\n", file=sys.stderr)
+        for c in writes:
+            print(f"  {c['method']:6} {c['status']}  {c['url']}", file=sys.stderr)
+        print("", file=sys.stderr)
 
     _print({"url": args.url, "calls_captured": len(calls), "calls": calls})
 
@@ -223,6 +233,11 @@ def build_parser() -> argparse.ArgumentParser:
     # tv-discover (all TradingView XHR/fetch calls)
     tvd = sub.add_parser("tv-discover", help="Capture ALL XHR/fetch calls made by a TradingView page (requires TRADINGVIEW_SESSION)")
     tvd.add_argument("url", help="Full URL, e.g. https://www.tradingview.com")
+    tvd.add_argument(
+        "--interactive", "-i",
+        action="store_true",
+        help="Open a VISIBLE browser and wait for you to perform an action before stopping capture — use this to find write (POST/PUT/PATCH) endpoints",
+    )
 
     return p
 

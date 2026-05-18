@@ -15,8 +15,10 @@ from the cookies in your TradingView browser session.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import sys
 from typing import Any, Optional
 
 import httpx
@@ -68,9 +70,15 @@ def _origin_from_url(url: str) -> str:
 
 
 class TradingViewClient:
-    def __init__(self, session_id: str, session_sign: Optional[str] = None):
+    def __init__(
+        self,
+        session_id: str,
+        session_sign: Optional[str] = None,
+        headless: bool = True,
+    ):
         self._session_id   = session_id
         self._session_sign = session_sign
+        self._headless     = headless
         self._pw           = None
         self._browser: Optional[Browser]          = None
         self._ctx:     Optional[BrowserContext]   = None
@@ -84,7 +92,7 @@ class TradingViewClient:
     async def __aenter__(self) -> "TradingViewClient":
         self._pw = await async_playwright().start()
         try:
-            self._browser = await self._pw.chromium.launch(headless=True)
+            self._browser = await self._pw.chromium.launch(headless=self._headless)
         except Exception as exc:
             await self._pw.stop()
             raise RuntimeError(
@@ -140,11 +148,16 @@ class TradingViewClient:
 
     # ------------------------------------------------------------------ discovery
 
-    async def discover_api_calls(self, url: str) -> list[dict]:
+    async def discover_api_calls(
+        self, url: str, interactive: bool = False
+    ) -> list[dict]:
         """
-        Load *url* in a headless browser (with your session cookie) and return
-        every XHR/fetch request TradingView makes.  Useful for debugging which
-        endpoints are live and finding the correct watchlist path.
+        Load *url* in a browser (with your session cookie) and return every
+        XHR/fetch call made.
+
+        *interactive=True*: opens a **visible** browser window and waits for
+        you to press Enter before capturing stops.  Use this to capture write
+        operations (e.g. editing a watchlist) that don't happen on page load.
         """
         assert self._ctx is not None
         calls: list[dict] = []
@@ -163,7 +176,18 @@ class TradingViewClient:
 
         page.on("response", on_response)
         try:
-            await page.goto(url, wait_until="networkidle", timeout=45_000)
+            if interactive:
+                await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+                print(
+                    "\n[tv-discover] Browser is open and capturing all API calls.\n"
+                    "  → Go to your watchlist, add or remove ONE symbol, then\n"
+                    "    come back here and press Enter to stop capture.",
+                    file=sys.stderr,
+                )
+                # run input() in a thread so the asyncio loop keeps processing events
+                await asyncio.get_event_loop().run_in_executor(None, input)
+            else:
+                await page.goto(url, wait_until="networkidle", timeout=45_000)
         except Exception as exc:
             raise RuntimeError(f"Could not load {url}: {exc}") from exc
         finally:
