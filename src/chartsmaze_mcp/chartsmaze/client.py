@@ -19,6 +19,7 @@ Data files used:
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import gzip
 import io
@@ -350,7 +351,18 @@ class ChartsMazeClient:
         """Discover file URLs and download+parse them once per client context."""
         if self._parsed:
             return
-        urls = await self._discover_gz_urls(f"{self.BASE}/custom-scanner")
+        # Load both pages in parallel — industry-analytics may expose additional
+        # industry gz columns that custom-scanner does not.
+        results = await asyncio.gather(
+            self._discover_gz_urls(f"{self.BASE}/custom-scanner"),
+            self._discover_gz_urls(f"{self.BASE}/industry-analytics"),
+            return_exceptions=True,
+        )
+        url_set: set[str] = set()
+        for r in results:
+            if isinstance(r, list):
+                url_set.update(r)
+        urls = list(url_set)
         if not urls:
             logger.warning("No .gz URLs discovered; data will be empty.")
             return
