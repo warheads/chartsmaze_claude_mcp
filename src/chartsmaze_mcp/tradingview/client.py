@@ -32,30 +32,33 @@ _UA = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Matches the base symbols_list path on any TradingView subdomain, e.g.:
+# Matches any TradingView watchlist/symbols_list collection endpoint, e.g.:
 #   https://in.tradingview.com/api/v1/symbols_list/all/?source=web
-#   https://www.tradingview.com/api/v2/symbols_lists/custom/
-# Captures group 1 = everything up to and including "symbols_list(s)/",
-# and group 2 = the optional sub-bucket (all | custom | colored | …)
-_SYMBOLS_LIST_RE = re.compile(
-    r"(https://[a-z]+\.tradingview\.com(?:/api/v\d+)?/symbols?_lists?/)"
-    r"([a-z]*/)?",
+#   https://in.tradingview.com/api/v1/watchlists/
+#   https://in.tradingview.com/api/v1/watchlists/?source=web
+# Captures group 1 = base URL up to and including the collection segment.
+_LIST_URL_RE = re.compile(
+    r"(https://[a-z]+\.tradingview\.com(?:/api/v\d+)?"
+    r"/(?:symbols?_lists?|watchlists?)/)",
     re.IGNORECASE,
 )
+
+# Sub-bucket suffixes that appear on the symbols_list READ endpoints but
+# should be stripped when deriving the CRUD base URL.
+_LIST_BUCKETS = {"all", "custom", "colored"}
 
 
 def _crud_base(list_url: str) -> str:
     """
-    Strip the sub-bucket suffix so we get the plain CRUD base, e.g.:
-      https://in.tradingview.com/api/v1/symbols_list/all/  →
-      https://in.tradingview.com/api/v1/symbols_list/
+    Derive the plain CRUD base from a discovered list URL, e.g.:
+      https://in.tradingview.com/api/v1/symbols_list/all/  →  …/symbols_list/
+      https://in.tradingview.com/api/v1/watchlists/        →  …/watchlists/
     """
-    m = _SYMBOLS_LIST_RE.match(list_url)
-    if m:
-        return m.group(1)
-    # Fallback: strip last path segment
     url = list_url.split("?")[0].rstrip("/")
-    return url.rsplit("/", 1)[0] + "/"
+    last = url.rsplit("/", 1)[-1]
+    if last in _LIST_BUCKETS:
+        url = url.rsplit("/", 1)[0]
+    return url + "/"
 
 
 def _origin_from_url(url: str) -> str:
@@ -172,18 +175,28 @@ class TradingViewClient:
         if self._list_url:
             return self._list_url
 
-        calls = await self.discover_api_calls(_TV_BASE + "/")
-
-        # Look for GET requests matching the symbols_list pattern on any subdomain.
-        matched: list[str] = []
-        for c in calls:
-            if c["method"] != "GET":
-                continue
-            if _SYMBOLS_LIST_RE.search(c["url"]):
-                matched.append(c["url"].split("?")[0])
+        # Try the homepage first, then the watchlists page which triggers the
+        # watchlists API call directly.
+        all_calls: list[dict] = []
+        for page_path in ("/", "/watchlists/"):
+            calls = await self.discover_api_calls(_TV_BASE + page_path)
+            all_calls.extend(calls)
+            matched = [
+                c["url"].split("?")[0]
+                for c in calls
+                if c["method"] == "GET" and _LIST_URL_RE.search(c["url"])
+            ]
+            # Prefer watchlists/ over symbols_list/ when both are present.
+            watchlist_hits = [u for u in matched if "watchlist" in u.lower()]
+            if watchlist_hits:
+                matched = watchlist_hits
+            if matched:
+                break
+        else:
+            matched = []
 
         if not matched:
-            captured = [f"  {c['method']} {c['url']}" for c in calls]
+            captured = [f"  {c['method']} {c['url']}" for c in all_calls]
             hint = "\n".join(captured[:30]) if captured else "  (none)"
             raise RuntimeError(
                 "Could not discover TradingView watchlist API endpoint.\n\n"
@@ -193,14 +206,10 @@ class TradingViewClient:
                 "    Application → Cookies → tradingview.com → sessionid.\n"
                 "  • Watchlist URL pattern changed — run:\n"
                 "    chartsmaze tv-discover https://www.tradingview.com\n"
-                "    and look for the symbols_list GET call, then open an issue."
+                "    and look for the watchlists GET call, then open an issue."
             )
 
-        # Use the URL seen most often; prefer /all/ over /custom/ or /colored/.
-        def _rank(u: str) -> int:
-            return matched.count(u) * 10 + (5 if "all" in u else 1)
-
-        best = max(set(matched), key=_rank)
+        best = max(set(matched), key=matched.count)
         self._list_url = best.rstrip("/") + "/"
         self._crud_url = _crud_base(self._list_url)
 
@@ -314,21 +323,47 @@ class TradingViewClient:
     async def create_watchlist(self, name: str, symbols: list[str]) -> dict:
         """Create a new watchlist."""
         await self._discover_list_url()
+        origin  = _origin_from_url(self._list_url or _TV_BASE)
+        payload = {"name": name, "symbols": symbols}
         return await self._browser_write([
-            ("POST", self._crud_url, {"name": name, "symbols": symbols}),
+            ("POST", self._crud_url,                        payload),
+            ("POST", f"{origin}/api/v1/watchlists/",        payload),
+            ("POST", f"{origin}/api/v1/symbols_list/",      payload),
         ])
 
     async def update_watchlist(self, watchlist_id: str, name: str, symbols: list[str]) -> dict:
         """Replace a watchlist's name and symbol list."""
         await self._discover_list_url()
         base    = self._crud_url
+        origin  = _origin_from_url(self._list_url or _TV_BASE)
         payload = {"name": name, "symbols": symbols}
-        return await self._browser_write([
-            ("PATCH", f"{base}{watchlist_id}/", payload),
-            ("PUT",   f"{base}{watchlist_id}/", payload),
-            ("POST",  base, {**payload, "id": watchlist_id}),
-            ("POST",  base, {**payload, "id": str(watchlist_id)}),
-        ])
+        # Build candidates: use discovered crud_url first, then explicit
+        # watchlists/ and symbols_list/ paths derived from the known origin.
+        wl_base   = f"{origin}/api/v1/watchlists/"
+        sl_base   = f"{origin}/api/v1/symbols_list/"
+        item_urls = {f"{base}{watchlist_id}/", f"{wl_base}{watchlist_id}/", f"{sl_base}{watchlist_id}/"}
+        candidates = [
+            (method, url, payload)
+            for url in [
+                f"{base}{watchlist_id}/",
+                f"{wl_base}{watchlist_id}/",
+                f"{sl_base}{watchlist_id}/",
+            ]
+            for method in ("PATCH", "PUT")
+        ] + [
+            ("POST", base,    {**payload, "id": watchlist_id}),
+            ("POST", wl_base, {**payload, "id": watchlist_id}),
+            ("POST", sl_base, {**payload, "id": watchlist_id}),
+        ]
+        # Deduplicate while preserving order.
+        seen: set[tuple] = set()
+        unique = []
+        for c in candidates:
+            key = (c[0], c[1])
+            if key not in seen:
+                seen.add(key)
+                unique.append(c)
+        return await self._browser_write(unique)
 
     async def add_to_watchlist(
         self,
