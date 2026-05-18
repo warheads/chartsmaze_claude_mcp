@@ -152,6 +152,11 @@ class ChartsMazeClient:
                 rank_3m=_int(row.get("Industry 3M Rank")),
                 stock_count=_int(row.get("Number of Stocks")),
                 market_cap=_flt(row.get("Group Market Cap")),
+                from_52w_high_pct=_flt(
+                    row.get("Industry % from 52W High")
+                    or row.get("% from 52W High")
+                    or row.get("Industry 52W High%")
+                ),
                 quadrant=rrg.get("quadrant"),
                 rs_ratio=rrg.get("rs_ratio"),
                 rs_momentum=rrg.get("rs_momentum"),
@@ -217,6 +222,11 @@ class ChartsMazeClient:
                 rank_3m=_int(row.get("Industry 3M Rank")),
                 stock_count=_int(row.get("Number of Stocks")),
                 market_cap=_flt(row.get("Group Market Cap")),
+                from_52w_high_pct=_flt(
+                    row.get("Industry % from 52W High")
+                    or row.get("% from 52W High")
+                    or row.get("Industry 52W High%")
+                ),
                 quadrant=rrg.get("quadrant"),
                 rs_ratio=rrg.get("rs_ratio"),
                 rs_momentum=rrg.get("rs_momentum"),

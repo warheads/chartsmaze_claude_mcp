@@ -101,11 +101,12 @@ class IndustryData(BaseModel):
     rank_1w:         Optional[int]   = None
     rank_1m:         Optional[int]   = None
     rank_3m:         Optional[int]   = None
-    stock_count:     Optional[int]   = None
-    market_cap:      Optional[float] = None
-    quadrant:        Optional[RRGQuadrant] = None
-    rs_ratio:        Optional[float] = None
-    rs_momentum:     Optional[float] = None
+    stock_count:        Optional[int]   = None
+    market_cap:         Optional[float] = None
+    from_52w_high_pct:  Optional[float] = None
+    quadrant:           Optional[RRGQuadrant] = None
+    rs_ratio:           Optional[float] = None
+    rs_momentum:        Optional[float] = None
 
     def trend_score(self) -> float:
         """
