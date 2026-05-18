@@ -168,9 +168,10 @@ def _draw_rank_perf_chart(fig: "plt.Figure", pool: list,
     colors = [GREEN if t[0].quadrant == RRGQuadrant.LEADING else YELLOW for t in valid]
     labels = [t[0].name[:18] for t in valid]
 
-    # Left Y: rank (low = best, normal direction)
+    # Left Y: rank — invert so rank 1 (best) is at the top
     ax.plot(xs, ranks, color=ACCENT, linewidth=2.0, marker="o", markersize=4, zorder=3)
-    ax.set_ylabel("Rank  (low = best)", color=ACCENT, fontsize=9)
+    ax.invert_yaxis()
+    ax.set_ylabel("Rank  (1 = best, top)", color=ACCENT, fontsize=9)
     ax.tick_params(axis="y", colors=FG, labelsize=8)
 
     # Right Y: performance %
@@ -224,7 +225,8 @@ def _draw_detail_chart(fig: "plt.Figure", ind) -> None:
                         xytext=(0, 10), textcoords="offset points",
                         ha="center", color=FG, fontsize=9, fontweight="bold")
 
-    ax.set_ylabel("Rank", color=ACCENT, fontsize=9)
+    ax.invert_yaxis()
+    ax.set_ylabel("Rank  (1 = best, top)", color=ACCENT, fontsize=9)
     ax.tick_params(axis="y", colors=FG, labelsize=9)
 
     # Right Y: performance
