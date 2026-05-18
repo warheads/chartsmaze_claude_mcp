@@ -104,6 +104,37 @@ class TradingViewClient:
 
     # ------------------------------------------------------------------ discovery
 
+    async def discover_api_calls(self, url: str) -> list[dict]:
+        """
+        Load *url* in a headless browser (with your session cookie) and return
+        every XHR/fetch request TradingView makes.  Useful for debugging which
+        endpoints are live and finding the correct watchlist path.
+        """
+        assert self._ctx is not None
+        calls: list[dict] = []
+        page = await self._ctx.new_page()
+
+        async def on_response(resp: Any) -> None:
+            req = resp.request
+            if req.resource_type not in ("xhr", "fetch"):
+                return
+            calls.append({
+                "method":       req.method,
+                "url":          req.url,
+                "status":       resp.status,
+                "content_type": resp.headers.get("content-type", ""),
+            })
+
+        page.on("response", on_response)
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=45_000)
+        except Exception as exc:
+            raise RuntimeError(f"Could not load {url}: {exc}") from exc
+        finally:
+            await page.close()
+
+        return calls
+
     async def _discover_list_url(self) -> str:
         """
         Load tradingview.com in a headless browser and intercept the GET request
@@ -112,42 +143,34 @@ class TradingViewClient:
         if self._list_url:
             return self._list_url
 
-        assert self._ctx is not None
-        found: list[str] = []
+        calls = await self.discover_api_calls(_TV_BASE + "/")
 
-        page = await self._ctx.new_page()
+        # Filter to GET calls whose URL matches the watchlist pattern.
+        matched = [
+            c["url"] for c in calls
+            if c["method"] == "GET" and _LIST_URL_RE.search(c["url"])
+        ]
 
-        async def on_response(resp: Any) -> None:
-            url = resp.url
-            if resp.request.method != "GET":
-                return
-            m = _LIST_URL_RE.search(url)
-            if m:
-                found.append(m.group(1))
-
-        page.on("response", on_response)
-        try:
-            logger.debug("Navigating to TradingView to discover watchlist API …")
-            await page.goto(_TV_BASE + "/", wait_until="networkidle", timeout=45_000)
-        except Exception as exc:
+        if not matched:
+            # Emit all captured URLs to help the user debug.
+            captured = [f"  {c['method']} {c['url']}" for c in calls]
+            hint = "\n".join(captured[:30]) if captured else "  (none)"
             raise RuntimeError(
-                f"Could not load TradingView to discover the watchlist API: {exc}"
-            ) from exc
-        finally:
-            await page.close()
-
-        if not found:
-            raise RuntimeError(
-                "Could not discover TradingView watchlist API endpoint.\n"
+                "Could not discover TradingView watchlist API endpoint.\n\n"
+                "Captured API calls:\n" + hint + "\n\n"
                 "Possible causes:\n"
-                "  • TRADINGVIEW_SESSION is expired — re-copy from DevTools → "
-                "Application → Cookies → tradingview.com → sessionid.\n"
-                "  • TradingView changed its API path — run 'chartsmaze discover "
-                "https://www.tradingview.com' to inspect intercepted requests."
+                "  • TRADINGVIEW_SESSION is expired — re-copy from DevTools →\n"
+                "    Application → Cookies → tradingview.com → sessionid.\n"
+                "  • Watchlist URL pattern changed — run:\n"
+                "    chartsmaze tv-discover https://www.tradingview.com\n"
+                "    and look for the 'lists' GET call, then open an issue."
             )
 
-        # Prefer the URL that was called most (handles redirects / duplicates).
-        self._list_url = max(set(found), key=found.count)
+        # Normalise: strip query string, ensure trailing slash.
+        url = matched[0].split("?")[0].rstrip("/") + "/"
+        # Prefer the URL called most often (dedup redirects).
+        url = max(set(matched), key=matched.count).split("?")[0].rstrip("/") + "/"
+        self._list_url = url
         logger.debug("Discovered watchlist list URL: %s", self._list_url)
         return self._list_url
 

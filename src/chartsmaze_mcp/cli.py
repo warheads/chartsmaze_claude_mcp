@@ -7,7 +7,8 @@ Usage:
     chartsmaze industries SECTOR    List industries in a sector
     chartsmaze screen SECTOR ...    Screen stocks with filters
     chartsmaze stock TICKER         Single stock info
-    chartsmaze discover URL         Capture API calls made by a ChartsMaze page
+    chartsmaze discover URL         Capture .gz data calls made by a ChartsMaze page
+    chartsmaze tv-discover URL      Capture ALL XHR/fetch calls made by a TradingView page
 """
 
 from __future__ import annotations
@@ -89,6 +90,23 @@ async def _cmd_discover(args: argparse.Namespace) -> None:
 
     async with ChartsMazeClient(session_cookie=os.environ.get("CHARTSMAZE_SESSION")) as cm:
         calls = await cm.discover_api_calls(args.url)
+
+    _print({"url": args.url, "calls_captured": len(calls), "calls": calls})
+
+
+async def _cmd_tv_discover(args: argparse.Namespace) -> None:
+    from .tradingview.client import TradingViewClient
+
+    tv_session = os.environ.get("TRADINGVIEW_SESSION")
+    if not tv_session:
+        print("ERROR: TRADINGVIEW_SESSION not set in .env", file=sys.stderr)
+        sys.exit(1)
+
+    async with TradingViewClient(
+        session_id=tv_session,
+        session_sign=os.environ.get("TRADINGVIEW_SESSION_SIGN"),
+    ) as tv:
+        calls = await tv.discover_api_calls(args.url)
 
     _print({"url": args.url, "calls_captured": len(calls), "calls": calls})
 
@@ -198,20 +216,25 @@ def build_parser() -> argparse.ArgumentParser:
     stk = sub.add_parser("stock", help="Single stock info")
     stk.add_argument("ticker", help="NSE/BSE ticker, e.g. RELIANCE")
 
-    # discover
-    disc = sub.add_parser("discover", help="Capture API calls made by a ChartsMaze page")
+    # discover (ChartsMaze .gz files)
+    disc = sub.add_parser("discover", help="Capture .gz data calls made by a ChartsMaze page")
     disc.add_argument("url", help="Full URL, e.g. https://chartsmaze.com/custom-scanner")
+
+    # tv-discover (all TradingView XHR/fetch calls)
+    tvd = sub.add_parser("tv-discover", help="Capture ALL XHR/fetch calls made by a TradingView page (requires TRADINGVIEW_SESSION)")
+    tvd.add_argument("url", help="Full URL, e.g. https://www.tradingview.com")
 
     return p
 
 
 _DISPATCH = {
-    "run": _cmd_run,
-    "sectors": _cmd_sectors,
-    "industries": _cmd_industries,
-    "screen": _cmd_screen,
-    "stock": _cmd_stock,
-    "discover": _cmd_discover,
+    "run":         _cmd_run,
+    "sectors":     _cmd_sectors,
+    "industries":  _cmd_industries,
+    "screen":      _cmd_screen,
+    "stock":       _cmd_stock,
+    "discover":    _cmd_discover,
+    "tv-discover": _cmd_tv_discover,
 }
 
 
