@@ -773,6 +773,26 @@ class ChartsMazeGUI(tk.Tk):
 # ── entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    import argparse
+    p = argparse.ArgumentParser(
+        prog="chartsmaze-gui",
+        description=(
+            "ChartsMaze AMOLED GUI — sector/industry analysis and ranking.\n\n"
+            "Layout:\n"
+            "  Top-left   : Sectors table, sortable by any column\n"
+            "  Top-middle : Industries table (select a sector or ALL SECTORS)\n"
+            "  Top-right  : Industry detail chart (3M → 1M → 1W rank + perf)\n"
+            "  Bottom     : Rank vs Performance charts for Leading & Improving "
+            "industries (tabs: 1W / 1M / 3M)\n\n"
+            "Tips:\n"
+            "  • Click any column header to sort; click again to reverse.\n"
+            "  • Select '▶ ALL SECTORS' in the sector list to see every industry.\n"
+            "  • Use '⤢ Expand' on a chart tab to open a full-screen popup.\n"
+            "  • Set CHARTSMAZE_SESSION in .env for authenticated data.\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.parse_args()   # handles --help / -h, exits on unknown flags
     app = ChartsMazeGUI()
     app.mainloop()
 
