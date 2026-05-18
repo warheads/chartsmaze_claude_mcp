@@ -140,11 +140,16 @@ class TradingViewClient:
             req = resp.request
             if req.resource_type not in ("xhr", "fetch"):
                 return
+            try:
+                body = req.post_data
+            except Exception:
+                body = None
             calls.append({
-                "method":       req.method,
-                "url":          req.url,
-                "status":       resp.status,
-                "content_type": resp.headers.get("content-type", ""),
+                "method":        req.method,
+                "url":           req.url,
+                "request_body":  body,
+                "status":        resp.status,
+                "content_type":  resp.headers.get("content-type", ""),
             })
 
         page.on("response", on_response)

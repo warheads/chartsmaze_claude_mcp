@@ -115,7 +115,11 @@ async def _cmd_tv_discover(args: argparse.Namespace) -> None:
         writes = [c for c in calls if c["method"] in ("POST", "PUT", "PATCH", "DELETE")]
         print(f"\n[tv-discover] {len(calls)} total calls, {len(writes)} write (POST/PUT/PATCH/DELETE):\n", file=sys.stderr)
         for c in writes:
+            body = c.get("request_body") or ""
+            body_preview = (body[:120] + "…") if len(body) > 120 else body
             print(f"  {c['method']:6} {c['status']}  {c['url']}", file=sys.stderr)
+            if body_preview:
+                print(f"         body: {body_preview}", file=sys.stderr)
         print("", file=sys.stderr)
 
     _print({"url": args.url, "calls_captured": len(calls), "calls": calls})
