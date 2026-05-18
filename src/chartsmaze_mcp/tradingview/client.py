@@ -262,7 +262,7 @@ class TradingViewClient:
             "POST",
             self._url(f"/api/v1/symbols_list/custom/{watchlist_id}/append/"),
             params={"source": "web"},
-            json={"symbols": symbols},
+            json=symbols,  # bare array — API rejects {"symbols": [...]}
         )
         return resp.json()
 
