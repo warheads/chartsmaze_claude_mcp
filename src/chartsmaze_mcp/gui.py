@@ -210,9 +210,9 @@ def _draw_detail_chart(fig: "plt.Figure", ind) -> None:
     ax = fig.add_subplot(111)
     _style_axes(ax)
 
-    periods = ["1W", "1M", "3M"]
-    ranks   = [ind.rank_1w,         ind.rank_1m,         ind.rank_3m]
-    perfs   = [ind.performance_1w,  ind.performance_1m,  ind.performance_3m]
+    periods = ["3M", "1M", "1W"]
+    ranks   = [ind.rank_3m,         ind.rank_1m,         ind.rank_1w]
+    perfs   = [ind.performance_3m,  ind.performance_1m,  ind.performance_1w]
     xs      = [0, 1, 2]
 
     # Left Y: rank
