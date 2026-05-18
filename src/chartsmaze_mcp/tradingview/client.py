@@ -248,20 +248,87 @@ class TradingViewClient:
             return data
         return data.get("lists", data.get("watchlists", data.get("data", [])))
 
+    async def _browser_write(self, candidates: list[tuple[str, str, dict]]) -> dict:
+        """
+        Try each (method, url, body) candidate by executing fetch() from inside
+        the live TradingView page so that session cookies and CSRF tokens are
+        attached automatically.  Returns the JSON response of the first 2xx.
+        Skips candidates that return 404 or 405; surfaces any other error.
+        """
+        origin = _origin_from_url(self._list_url or _TV_BASE)
+        assert self._ctx is not None
+        page = await self._ctx.new_page()
+        try:
+            await page.goto(origin + "/", wait_until="domcontentloaded", timeout=30_000)
+            result = await page.evaluate(
+                """async (candidates) => {
+                    const csrf = (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || '';
+                    for (const [method, url, body] of candidates) {
+                        let r;
+                        try {
+                            r = await fetch(url, {
+                                method,
+                                credentials: 'include',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'X-CSRFToken': csrf,
+                                },
+                                body: JSON.stringify(body),
+                            });
+                        } catch (e) { continue; }
+                        const text = await r.text();
+                        let data;
+                        try { data = JSON.parse(text); } catch { data = {_raw: text}; }
+                        if (r.ok) return {ok: true, status: r.status, method, url, data};
+                        if (r.status !== 404 && r.status !== 405)
+                            return {ok: false, status: r.status, method, url, data};
+                    }
+                    return null;
+                }""",
+                candidates,
+            )
+        finally:
+            await page.close()
+
+        if result is None:
+            tried = ", ".join(f"{m} {u}" for m, u, _ in candidates)
+            raise RuntimeError(
+                f"No write endpoint accepted the request (tried: {tried}).\n"
+                "Run 'chartsmaze tv-discover https://www.tradingview.com' while\n"
+                "manually editing a TradingView watchlist to find the real endpoint."
+            )
+        if not result["ok"]:
+            status = result["status"]
+            if status in (401, 403):
+                raise PermissionError(
+                    f"TradingView auth failed (HTTP {status}). "
+                    "Your TRADINGVIEW_SESSION cookie may be expired."
+                )
+            raise RuntimeError(
+                f"TradingView returned HTTP {status} for {result['method']} {result['url']}:\n"
+                f"{result['data']}"
+            )
+        logger.debug("write succeeded: %s %s", result["method"], result["url"])
+        return result["data"]
+
     async def create_watchlist(self, name: str, symbols: list[str]) -> dict:
         """Create a new watchlist."""
         await self._discover_list_url()
-        resp = await self._request(
-            "POST", self._crud_url, json={"name": name, "symbols": symbols}
-        )
-        return resp.json()
+        return await self._browser_write([
+            ("POST", self._crud_url, {"name": name, "symbols": symbols}),
+        ])
 
     async def update_watchlist(self, watchlist_id: str, name: str, symbols: list[str]) -> dict:
         """Replace a watchlist's name and symbol list."""
         await self._discover_list_url()
-        url  = f"{self._crud_url}{watchlist_id}/"
-        resp = await self._request("PUT", url, json={"name": name, "symbols": symbols})
-        return resp.json()
+        base    = self._crud_url
+        payload = {"name": name, "symbols": symbols}
+        return await self._browser_write([
+            ("PATCH", f"{base}{watchlist_id}/", payload),
+            ("PUT",   f"{base}{watchlist_id}/", payload),
+            ("POST",  base, {**payload, "id": watchlist_id}),
+            ("POST",  base, {**payload, "id": str(watchlist_id)}),
+        ])
 
     async def add_to_watchlist(
         self,
