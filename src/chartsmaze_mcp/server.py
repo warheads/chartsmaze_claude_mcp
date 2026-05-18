@@ -378,11 +378,12 @@ async def discover_api_calls(
     ]
 ) -> str:
     """
-    Load *url* in a headless browser, capture every JSON API call made,
-    and return the endpoint URLs with top-level response keys.
+    Load *url* in a headless browser and list every .gz data file the page
+    downloads from the ChartsMaze CDN.
 
-    Use this to understand ChartsMaze's internal API structure so you can
-    refine the scraping logic or call endpoints directly.
+    Each file URL contains a content-hash that changes when the data is
+    refreshed. Use this to inspect what raw data is available and to debug
+    connectivity issues.
     """
     async with _cm_client() as cm:
         calls = await cm.discover_api_calls(url)

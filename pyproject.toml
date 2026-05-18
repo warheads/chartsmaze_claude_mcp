@@ -20,6 +20,7 @@ dependencies = [
 
 [project.scripts]
 chartsmaze-mcp = "chartsmaze_mcp.server:main"
+chartsmaze = "chartsmaze_mcp.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/chartsmaze_mcp"]

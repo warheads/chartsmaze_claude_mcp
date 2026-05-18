@@ -1,42 +1,69 @@
 """
-ChartsMaze scraper client.
+ChartsMaze data loader — direct CSV approach.
 
-Strategy (applied in order per page):
-  1. Intercept XHR/fetch JSON responses — cleanest when it works.
-  2. Parse window.__NEXT_DATA__ embedded in the HTML — reliable for Next.js SSR.
-  3. DOM-scrape the rendered table/card layout — fallback.
+ChartsMaze serves its data as gzip-compressed CSVs from its own CDN
+(under /static/media/).  The filenames include content-hash suffixes that
+rotate whenever the data is updated, so we:
 
-Because ChartsMaze is a React SPA, Playwright is used to execute JavaScript
-before any extraction is attempted.
+  1. Load the scanner page with Playwright once to capture all .gz URLs.
+  2. Download those files via httpx (no auth needed — they're public).
+  3. Parse, join, and filter the CSV data entirely in Python.
+
+Data files used:
+  rs_filter.gz       — 88-column stock sheet: sector, industry, 20d vol MA,
+                       circuit limit, RS rating, price, exchange, …
+  fundamental.gz     — 68-column earnings sheet: YoY EPS %, YoY Sales %, P/E, …
+  industry.gz        — 12-column industry sheet: 1D/1W/1M/3M performance, rank
+  rrg_daily.gz       — Daily RS-Ratio,RS-Momentum time series for 1 300+ indices
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
+import csv
+import gzip
+import io
 import logging
-import re
 from typing import Any, Optional
 
-from playwright.async_api import (
-    Browser,
-    BrowserContext,
-    Page,
-    Response,
-    async_playwright,
-)
+import httpx
+from playwright.async_api import Browser, BrowserContext, async_playwright
 
 from .models import IndustryData, RRGQuadrant, SectorData, StockData
 
 logger = logging.getLogger(__name__)
 
-_BROWSER_UA = (
+_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-_RRG_QUADRANT_VALUES = {q.value for q in RRGQuadrant}
+# Patterns to match against the URL path for each data role.
+_FILE_PATTERNS: dict[str, str] = {
+    "rs_filter":   "RS%20filter",
+    "fundamental": "fundamental%20analysis",
+    "industry":    "Industry%20Analysis",
+    "rrg_daily":   "RRG_Index_and_Industry_D",
+    "rrg_weekly":  "RRG_Index_and_Industry_W",
+}
+
+# Column aliases used in RS filter CSV.
+_COL_TICKER        = "Stock Name"
+_COL_COMPANY       = "Company Name"
+_COL_SECTOR        = "Sector"
+_COL_INDUSTRY      = "Basic Industry"
+_COL_PRICE         = "Stock Price"
+_COL_CHANGE_1D     = "1 Day Returns(%)"
+_COL_VOL_20D_MA    = "20 Days MA Volume"
+_COL_CIRCUIT_LIMIT = "Circuit Limit"
+_COL_MARKET_CAP    = "Market Cap"
+_COL_RS_RATING     = "RS Rating"
+_COL_EXCHANGE      = "Exchange"
+
+# Column aliases used in fundamental CSV.
+_COL_EPS_YOY  = "YoY % EPS Latest"
+_COL_SALES_YOY = "YoY % Sales Latest"
+_COL_PE        = "P/E"
 
 
 class ChartsMazeClient:
@@ -44,32 +71,29 @@ class ChartsMazeClient:
 
     def __init__(self, session_cookie: Optional[str] = None):
         self._session_cookie = session_cookie
-        self._pw = None
-        self._browser: Optional[Browser] = None
-        self._ctx: Optional[BrowserContext] = None
+        # Caches populated during a single context.
+        self._file_urls: dict[str, str] = {}
+        self._parsed:    dict[str, list[dict]] = {}
+        self._pw   = None
+        self._browser: Optional[Browser]        = None
+        self._ctx:     Optional[BrowserContext] = None
 
     # ------------------------------------------------------------------ lifecycle
 
     async def __aenter__(self) -> "ChartsMazeClient":
         self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(headless=True)
+        try:
+            self._browser = await self._pw.chromium.launch(headless=True)
+        except Exception as exc:
+            await self._pw.stop()
+            raise RuntimeError(
+                "Chromium not found. Run: python -m playwright install chromium"
+            ) from exc
         self._ctx = await self._browser.new_context(
-            user_agent=_BROWSER_UA,
+            user_agent=_UA,
             viewport={"width": 1280, "height": 900},
+            ignore_https_errors=True,
         )
-        if self._session_cookie:
-            await self._ctx.add_cookies(
-                [
-                    {
-                        "name": "session",
-                        "value": self._session_cookie,
-                        "domain": "chartsmaze.com",
-                        "path": "/",
-                        "httpOnly": True,
-                        "secure": True,
-                    }
-                ]
-            )
         return self
 
     async def __aexit__(self, *_: Any) -> None:
@@ -83,48 +107,104 @@ class ChartsMazeClient:
     # ------------------------------------------------------------------ public API
 
     async def get_sector_analysis(self) -> list[SectorData]:
-        """Return all sectors with performance + RRG quadrant data."""
-        probe_urls = [
-            f"{self.BASE}/",
-            f"{self.BASE}/market-breadth",
-        ]
-        for url in probe_urls:
-            nd, calls = await self._load(url)
-            for c in calls:
-                sectors = _parse_sectors(c["data"], c["url"])
-                if sectors:
-                    return sectors
-            if nd:
-                sectors = _sectors_from_next_data(nd)
-                if sectors:
-                    return sectors
-        return []
+        """
+        Return sectors ranked by a composite score:
+          • RRG quadrant from the most recent daily RS_Ratio / RS_Momentum
+          • 1-day performance aggregated from constituent industries
+        """
+        await self._ensure_data()
+        industry_rows = self._parsed.get("industry", [])
+        rs_rows       = self._parsed.get("rs_filter", [])
+        rrg_rows      = self._parsed.get("rrg_daily", [])
+
+        # Build sector → list[industry row] map.
+        industry_to_sector: dict[str, str] = {}
+        for r in rs_rows:
+            ind = r.get(_COL_INDUSTRY, "").strip()
+            sec = r.get(_COL_SECTOR, "").strip()
+            if ind and sec:
+                industry_to_sector[ind] = sec
+
+        # Aggregate industry perf into sectors.
+        sector_perf: dict[str, list[float]] = {}
+        for row in industry_rows:
+            ind = row.get("Basic Industry", "").strip()
+            sec = industry_to_sector.get(ind, "")
+            if not sec:
+                continue
+            p1d = _flt(row.get("Industry 1D Performance(%)", ""))
+            if p1d is not None:
+                sector_perf.setdefault(sec, []).append(p1d)
+
+        # Parse RRG: latest date for each sector/index.
+        rrg_latest = _parse_rrg_latest(rrg_rows, industry_to_sector)
+
+        sectors: list[SectorData] = []
+        for sec, perfs in sector_perf.items():
+            avg_1d = sum(perfs) / len(perfs) if perfs else None
+            rrg = rrg_latest.get(sec, {})
+            rs_ratio   = rrg.get("rs_ratio")
+            rs_momentum = rrg.get("rs_momentum")
+            quadrant   = rrg.get("quadrant")
+            sectors.append(SectorData(
+                name=sec,
+                performance_1d=avg_1d,
+                quadrant=quadrant,
+                rs_ratio=rs_ratio,
+                rs_momentum=rs_momentum,
+            ))
+
+        return sectors
 
     async def get_industry_analysis(self, sector: str) -> list[IndustryData]:
-        """Return industries (optionally filtered to a sector)."""
-        nd, calls = await self._load(f"{self.BASE}/")
-        for c in calls:
-            industries = _parse_industries(c["data"], c["url"], sector)
-            if industries:
-                return industries
-        if nd:
-            return _industries_from_next_data(nd, sector)
-        return []
+        """Return industries, optionally filtered to *sector*."""
+        await self._ensure_data()
+        industry_rows = self._parsed.get("industry", [])
+        rs_rows       = self._parsed.get("rs_filter", [])
+        rrg_rows      = self._parsed.get("rrg_daily", [])
+
+        industry_to_sector: dict[str, str] = {
+            r[_COL_INDUSTRY]: r[_COL_SECTOR]
+            for r in rs_rows
+            if r.get(_COL_INDUSTRY) and r.get(_COL_SECTOR)
+        }
+        rrg_latest = _parse_rrg_latest(rrg_rows, industry_to_sector)
+
+        industries: list[IndustryData] = []
+        for row in industry_rows:
+            ind    = row.get("Basic Industry", "").strip()
+            ind_sec = industry_to_sector.get(ind, "")
+            if sector and ind_sec and sector.lower() not in ind_sec.lower():
+                continue
+            rrg    = rrg_latest.get(ind, {})
+            industries.append(IndustryData(
+                name=ind,
+                sector=ind_sec,
+                performance_1d=_flt(row.get("Industry 1D Performance(%)")),
+                performance_5d=_flt(row.get("Industry 1W Performance(%)")),
+                quadrant=rrg.get("quadrant"),
+                rs_ratio=rrg.get("rs_ratio"),
+                rs_momentum=rrg.get("rs_momentum"),
+            ))
+
+        return sorted(industries, key=lambda i: i.performance_1d or 0.0, reverse=True)
 
     async def get_rrg_leaders(self) -> list[dict]:
-        """Return only the sectors/industries in the RRG Leading quadrant."""
-        nd, calls = await self._load(
-            f"{self.BASE}/",
-            wait_for="canvas, .rrg-chart, [class*='rrg'], [class*='rotation']",
-        )
-        all_rrg: list[dict] = []
-        for c in calls:
-            pts = _parse_rrg(c["data"], c["url"])
-            if pts:
-                all_rrg.extend(pts)
-        if not all_rrg and nd:
-            all_rrg = _rrg_from_next_data(nd)
-        return [d for d in all_rrg if d.get("quadrant") == RRGQuadrant.LEADING.value]
+        """Return sectors/industries currently in the Leading RRG quadrant."""
+        await self._ensure_data()
+        rrg_rows = self._parsed.get("rrg_daily", [])
+        rs_rows  = self._parsed.get("rs_filter", [])
+        industry_to_sector = {
+            r[_COL_INDUSTRY]: r[_COL_SECTOR]
+            for r in rs_rows
+            if r.get(_COL_INDUSTRY) and r.get(_COL_SECTOR)
+        }
+        rrg_latest = _parse_rrg_latest(rrg_rows, industry_to_sector)
+        return [
+            {"name": name, **data}
+            for name, data in rrg_latest.items()
+            if data.get("quadrant") == RRGQuadrant.LEADING
+        ]
 
     async def screen_stocks(
         self,
@@ -135,522 +215,264 @@ class ChartsMazeClient:
         exclude_circuit: bool = True,
     ) -> list[StockData]:
         """
-        Run the custom scanner, apply filters, return qualifying stocks.
+        Filter all stocks from the RS filter + fundamental data.
 
-        The scanner page is browser-automated: sector/volume filters are set
-        via the UI before capturing the resulting API call.
+        Filters applied:
+          • Sector membership (if *sectors* is non-empty)
+          • 20-day volume MA >= *min_volume_20d_ma*
+          • Circuit limit > 5 % (proxy for illiquid/circuit-prone stocks)
+          • YoY EPS growth >= *min_eps_growth_pct*
+          • YoY Sales growth >= *min_revenue_growth_pct*
         """
-        page: Page = await self._ctx.new_page()
-        captured: list[dict] = []
+        await self._ensure_data()
+        rs_rows   = self._parsed.get("rs_filter", [])
+        fund_rows = self._parsed.get("fundamental", [])
 
-        async def _on_response(r: Response) -> None:
-            if "application/json" in r.headers.get("content-type", ""):
-                try:
-                    captured.append({"url": r.url, "data": await r.json()})
-                except Exception:
-                    pass
+        # Build ticker → fundamental row map.
+        fund_map: dict[str, dict] = {r[_COL_TICKER]: r for r in fund_rows if r.get(_COL_TICKER)}
 
-        page.on("response", _on_response)
+        stocks: list[StockData] = []
+        for r in rs_rows:
+            ticker = r.get(_COL_TICKER, "").strip()
+            if not ticker:
+                continue
 
-        try:
-            await page.goto(f"{self.BASE}/custom-scanner", wait_until="networkidle", timeout=40_000)
+            sec = r.get(_COL_SECTOR, "").strip()
+            if sectors and not any(s.lower() in sec.lower() for s in sectors):
+                continue
 
-            # --- set sector filter ---
-            for sector in sectors:
-                await _try_set_filter(page, sector, selectors=[
-                    '[data-filter="sector"]',
-                    'select[name="sector"]',
-                    '[placeholder*="sector" i]',
-                    '[aria-label*="sector" i]',
-                ])
+            vol_20d = _flt(r.get(_COL_VOL_20D_MA))
+            if vol_20d is not None and vol_20d < min_volume_20d_ma:
+                continue
 
-            # --- set min volume filter ---
-            await _try_fill_input(page, str(min_volume_20d_ma), selectors=[
-                '[data-filter="volume"]',
-                'input[name*="volume" i]',
-                '[placeholder*="volume" i]',
-                '[placeholder*="vol" i]',
-            ])
+            if exclude_circuit:
+                circuit_pct = _flt(r.get(_COL_CIRCUIT_LIMIT))
+                if circuit_pct is not None and circuit_pct <= 5:
+                    continue
 
-            # --- set EPS growth filter ---
-            if min_eps_growth_pct > 0:
-                await _try_fill_input(page, str(min_eps_growth_pct), selectors=[
-                    '[data-filter="eps"]',
-                    'input[name*="eps" i]',
-                    '[placeholder*="eps" i]',
-                ])
+            f = fund_map.get(ticker, {})
+            eps_yoy   = _flt(f.get(_COL_EPS_YOY))
+            sales_yoy = _flt(f.get(_COL_SALES_YOY))
 
-            # --- set revenue growth filter ---
-            if min_revenue_growth_pct > 0:
-                await _try_fill_input(page, str(min_revenue_growth_pct), selectors=[
-                    '[data-filter="revenue"]',
-                    'input[name*="revenue" i]',
-                    '[placeholder*="revenue" i]',
-                    '[placeholder*="sales" i]',
-                ])
+            if min_eps_growth_pct > 0 and (eps_yoy is None or eps_yoy < min_eps_growth_pct):
+                continue
+            if min_revenue_growth_pct > 0 and (sales_yoy is None or sales_yoy < min_revenue_growth_pct):
+                continue
 
-            # submit / trigger search
-            await _try_click(page, selectors=[
-                'button[type="submit"]',
-                'button:has-text("Scan")',
-                'button:has-text("Search")',
-                'button:has-text("Filter")',
-                'button:has-text("Apply")',
-            ])
+            stocks.append(StockData(
+                ticker=ticker,
+                name=r.get(_COL_COMPANY) or ticker,
+                sector=sec,
+                industry=r.get(_COL_INDUSTRY, "").strip() or None,
+                price=_flt(r.get(_COL_PRICE)),
+                change_pct=_flt(r.get(_COL_CHANGE_1D)),
+                volume_20d_ma=int(vol_20d) if vol_20d is not None else None,
+                circuit_status=None,
+                eps_growth_pct=eps_yoy,
+                revenue_growth_pct=sales_yoy,
+                market_cap=_flt(r.get(_COL_MARKET_CAP)),
+                pe_ratio=_flt(f.get(_COL_PE)) if f else None,
+            ))
 
-            await page.wait_for_load_state("networkidle", timeout=20_000)
-            await asyncio.sleep(1.5)
-
-            # extract from intercepted API calls
-            all_stocks: list[StockData] = []
-            for c in captured:
-                stocks = _parse_stocks(c["data"], c["url"])
-                if stocks:
-                    all_stocks.extend(stocks)
-                    break
-
-            # fallback: DOM scrape
-            if not all_stocks:
-                all_stocks = await _scrape_table(page)
-
-        finally:
-            await page.close()
-
-        return _apply_filters(
-            all_stocks,
-            sectors=sectors,
-            min_eps_growth_pct=min_eps_growth_pct,
-            min_revenue_growth_pct=min_revenue_growth_pct,
-            min_volume_20d_ma=min_volume_20d_ma,
-            exclude_circuit=exclude_circuit,
-        )
+        return sorted(stocks, key=lambda s: s.eps_growth_pct or 0.0, reverse=True)
 
     async def get_stock_info(self, ticker: str) -> Optional[StockData]:
-        """Fetch the stock-info page for a single ticker."""
-        nd, calls = await self._load(f"{self.BASE}/stock-info/{ticker}")
-        for c in calls:
-            s = _parse_single_stock(c["data"], ticker)
-            if s:
-                return s
-        if nd:
-            return _stock_from_next_data(nd, ticker)
+        """Return all available data for a single ticker."""
+        await self._ensure_data()
+        rs_rows   = self._parsed.get("rs_filter", [])
+        fund_rows = self._parsed.get("fundamental", [])
+        fund_map  = {r[_COL_TICKER]: r for r in fund_rows if r.get(_COL_TICKER)}
+
+        target = ticker.upper()
+        for r in rs_rows:
+            if r.get(_COL_TICKER, "").upper() != target:
+                continue
+            f  = fund_map.get(target, {})
+            vol_20d = _flt(r.get(_COL_VOL_20D_MA))
+            return StockData(
+                ticker=target,
+                name=r.get(_COL_COMPANY) or target,
+                sector=r.get(_COL_SECTOR, "").strip() or None,
+                industry=r.get(_COL_INDUSTRY, "").strip() or None,
+                price=_flt(r.get(_COL_PRICE)),
+                change_pct=_flt(r.get(_COL_CHANGE_1D)),
+                volume_20d_ma=int(vol_20d) if vol_20d is not None else None,
+                circuit_status=None,
+                eps_growth_pct=_flt(f.get(_COL_EPS_YOY)),
+                revenue_growth_pct=_flt(f.get(_COL_SALES_YOY)),
+                market_cap=_flt(r.get(_COL_MARKET_CAP)),
+                pe_ratio=_flt(f.get(_COL_PE)) if f else None,
+            )
         return None
 
     async def discover_api_calls(self, url: str) -> list[dict]:
-        """
-        Load *url* and return every JSON API call observed.
-        Useful for understanding ChartsMaze's internal API structure.
-        """
-        _, calls = await self._load(url)
-        return [{"url": c["url"], "keys": list(c["data"].keys()) if isinstance(c["data"], dict) else type(c["data"]).__name__} for c in calls]
+        """Load *url* and return the .gz data-file URLs the page requests."""
+        gz_urls = await self._discover_gz_urls(url)
+        return [{"url": u} for u in gz_urls]
 
     # ------------------------------------------------------------------ internals
 
-    async def _load(
-        self,
-        url: str,
-        wait_for: Optional[str] = None,
-        timeout: int = 35_000,
-    ) -> tuple[Any, list[dict]]:
-        """Load *url*, return (next_data, captured_json_responses)."""
-        page: Page = await self._ctx.new_page()
-        captured: list[dict] = []
-
-        async def _on_response(r: Response) -> None:
-            if "application/json" in r.headers.get("content-type", ""):
+    async def _ensure_data(self) -> None:
+        """Discover file URLs and download+parse them once per client context."""
+        if self._parsed:
+            return
+        urls = await self._discover_gz_urls(f"{self.BASE}/custom-scanner")
+        if not urls:
+            logger.warning("No .gz URLs discovered; data will be empty.")
+            return
+        async with httpx.AsyncClient(
+            headers={"User-Agent": _UA, "Referer": self.BASE + "/"},
+            verify=False,
+            timeout=60.0,
+        ) as http:
+            for role, pattern in _FILE_PATTERNS.items():
+                url = next((u for u in urls if pattern in u), None)
+                if not url:
+                    logger.debug("File not found for role %s", role)
+                    continue
                 try:
-                    captured.append({"url": r.url, "data": await r.json()})
-                except Exception:
-                    pass
+                    resp = await http.get(url)
+                    resp.raise_for_status()
+                    body = gzip.decompress(resp.content)
+                    rows = list(csv.DictReader(io.StringIO(body.decode("utf-8"))))
+                    self._parsed[role] = rows
+                    logger.debug("Loaded %s: %d rows from %s", role, len(rows), url)
+                except Exception as exc:
+                    logger.warning("Failed to load %s from %s: %s", role, url, exc)
 
-        page.on("response", _on_response)
+    async def _discover_gz_urls(self, page_url: str) -> list[str]:
+        """Navigate to *page_url* and collect all .gz file URLs."""
+        assert self._ctx is not None
+        page = await self._ctx.new_page()
+        gz_urls: list[str] = []
 
+        async def on_request(req: Any) -> None:
+            u = req.url
+            if ".gz" in u and "chartsmaze" in u:
+                gz_urls.append(u)
+
+        page.on("request", on_request)
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-            await page.wait_for_load_state("networkidle", timeout=timeout)
-            if wait_for:
-                try:
-                    await page.wait_for_selector(wait_for, timeout=8_000)
-                except Exception:
-                    pass
-
-            next_data: Any = await page.evaluate(
-                """() => {
-                    const el = document.getElementById('__NEXT_DATA__');
-                    if (!el) return null;
-                    try { return JSON.parse(el.textContent); } catch { return null; }
-                }"""
-            )
+            await page.goto(page_url, wait_until="networkidle", timeout=45_000)
         finally:
             await page.close()
 
-        return next_data, captured
+        return gz_urls
 
 
-# ============================================================ parsing helpers
+# ============================================================ helpers
 
-def _flt(d: dict, keys: list[str]) -> Optional[float]:
-    for k in keys:
-        v = d.get(k)
-        if v is not None:
-            try:
-                return float(str(v).replace(",", "").replace("%", "").strip())
-            except (ValueError, TypeError):
-                pass
-    return None
-
-
-def _int(d: dict, keys: list[str]) -> Optional[int]:
-    for k in keys:
-        v = d.get(k)
-        if v is not None:
-            try:
-                return int(float(str(v).replace(",", "").strip()))
-            except (ValueError, TypeError):
-                pass
-    return None
-
-
-def _items(data: Any, *candidate_keys: str) -> list:
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        for k in candidate_keys:
-            v = data.get(k)
-            if isinstance(v, list):
-                return v
-    return []
-
-
-def _quadrant_from_rs(rs_ratio: Optional[float], rs_momentum: Optional[float]) -> Optional[RRGQuadrant]:
-    if rs_ratio is None or rs_momentum is None:
+def _flt(v: Any) -> Optional[float]:
+    if v is None:
         return None
+    try:
+        return float(str(v).replace(",", "").replace("%", "").strip())
+    except (ValueError, TypeError):
+        return None
+
+
+
+# Maps "Nifty X" index name prefixes → sector names used in RS filter.gz
+_NIFTY_TO_SECTOR: dict[str, str] = {
+    "Nifty Auto":                       "Auto",
+    "Nifty Consumer Durables":          "Consumer Durables",
+    "Nifty Pharma":                     "Healthcare",
+    "Nifty Healthcare Index":           "Healthcare",
+    "Nifty Bank":                       "Financial Services",
+    "Nifty Financial Services":         "Financial Services",
+    "Nifty Private Bank":               "Financial Services",
+    "Nifty FMCG":                       "FMCG",
+    "Nifty IT":                         "Information Technology",
+    "Nifty Metal":                      "Metals & Mining",
+    "Nifty Realty":                     "Realty",
+    "Nifty Energy":                     "Oil, Gas & Consumable fuels",
+    "Nifty Oil & Gas":                  "Oil, Gas & Consumable fuels",
+    "Nifty Media":                      "Media Entertainment & Publication",
+    "Nifty Infrastructure":             "Construction",
+    "Nifty PSU Bank":                   "Financial Services",
+    "Nifty Capital Markets":            "Financial Services",
+    "Nifty India Consumption":          "Consumer Services",
+    "Nifty Services Sector":            "Services",
+    "Nifty Commodities":                "Metals & Mining",
+}
+
+
+def _parse_rrg_latest(
+    rrg_rows: list[dict],
+    industry_to_sector: dict[str, str],
+) -> dict[str, dict]:
+    """
+    Parse the RRG CSV and return a map of ``name → {rs_ratio, rs_momentum, quadrant}``.
+
+    Row names come in two forms:
+      • ``"Nifty Consumer Durables:Nifty 500"``  → sector-level index
+      • ``"Electrical - Power Equipment MCW:Nifty 500"``  → industry-level (MCW/EW weighted)
+
+    We prefer MCW (market-cap weighted) rows over EW rows when both exist.
+    We take the latest (rightmost) non-empty date column.
+    """
+    if not rrg_rows:
+        return {}
+
+    date_cols: list[str] = [k for k in rrg_rows[0].keys() if k != "Index Name:Benchmark"]
+
+    raw: dict[str, dict] = {}  # canonical_name → entry
+    for row in rrg_rows:
+        full_name = row.get("Index Name:Benchmark", "").strip()
+        if not full_name:
+            continue
+        short = full_name.split(":")[0].strip()
+
+        # Strip MCW/EW suffix to get the canonical industry name.
+        is_mcw = short.endswith(" MCW")
+        is_ew  = short.endswith(" EW")
+        canonical = short[:-4].strip() if (is_mcw or is_ew) else short
+
+        # Skip EW if MCW is (or will be) present — MCW is more representative.
+        if is_ew and canonical in raw:
+            continue
+
+        rs_ratio = rs_momentum = None
+        for col in reversed(date_cols):
+            val = row.get(col, "").strip()
+            if not val:
+                continue
+            parts = val.split(",")
+            if len(parts) == 2:
+                rs_ratio    = _flt(parts[0])
+                rs_momentum = _flt(parts[1])
+                break
+
+        if rs_ratio is None or rs_momentum is None:
+            continue
+
+        raw[canonical] = {
+            "rs_ratio":    rs_ratio,
+            "rs_momentum": rs_momentum,
+            "quadrant":    _quadrant(rs_ratio, rs_momentum),
+        }
+
+    # Build final result: key by industry name, sector name, and Nifty→sector mapping.
+    result: dict[str, dict] = {}
+    for canonical, entry in raw.items():
+        result[canonical] = entry
+        # Map Nifty index → sector.
+        sec = _NIFTY_TO_SECTOR.get(canonical)
+        if sec and sec not in result:
+            result[sec] = entry
+        # Map industry → sector.
+        sec2 = industry_to_sector.get(canonical)
+        if sec2 and sec2 not in result:
+            result[sec2] = entry
+
+    return result
+
+
+def _quadrant(rs_ratio: float, rs_momentum: float) -> RRGQuadrant:
     if rs_ratio > 100 and rs_momentum > 100:
         return RRGQuadrant.LEADING
     if rs_ratio > 100:
         return RRGQuadrant.WEAKENING
-    if rs_momentum <= 100 and rs_ratio <= 100:
-        return RRGQuadrant.LAGGING
-    return RRGQuadrant.IMPROVING
-
-
-def _parse_sectors(data: Any, url: str) -> list[SectorData]:
-    rows = _items(data, "sectors", "sectorData", "data", "result", "rows")
-    out = []
-    for r in rows:
-        if not isinstance(r, dict):
-            continue
-        name = r.get("sector") or r.get("sectorName") or r.get("name") or r.get("title")
-        if not name:
-            continue
-        perf_1d = _flt(r, ["change_pct", "change", "perf_1d", "1d", "dayChange", "performance"])
-        perf_5d = _flt(r, ["perf_5d", "5d", "weekChange"])
-        perf_1m = _flt(r, ["perf_1m", "1m", "monthChange"])
-        rs_ratio = _flt(r, ["rs_ratio", "rsRatio", "RS_Ratio", "x"])
-        rs_momentum = _flt(r, ["rs_momentum", "rsMomentum", "RS_Momentum", "y"])
-        raw_q = r.get("quadrant") or r.get("rrg_quadrant")
-        quadrant = (
-            RRGQuadrant(raw_q)
-            if raw_q in _RRG_QUADRANT_VALUES
-            else _quadrant_from_rs(rs_ratio, rs_momentum)
-        )
-        out.append(SectorData(
-            name=str(name),
-            performance_1d=perf_1d,
-            performance_5d=perf_5d,
-            performance_1m=perf_1m,
-            quadrant=quadrant,
-            rs_ratio=rs_ratio,
-            rs_momentum=rs_momentum,
-            stock_count=_int(r, ["count", "stockCount", "stocks"]),
-        ))
-    return out
-
-
-def _parse_industries(data: Any, url: str, sector: str) -> list[IndustryData]:
-    rows = _items(data, "industries", "industryData", "data", "result")
-    out = []
-    for r in rows:
-        if not isinstance(r, dict):
-            continue
-        item_sector = r.get("sector") or r.get("sectorName") or ""
-        if sector and item_sector and sector.lower() not in item_sector.lower():
-            continue
-        name = r.get("industry") or r.get("industryName") or r.get("name")
-        if not name:
-            continue
-        rs_ratio = _flt(r, ["rs_ratio", "rsRatio", "x"])
-        rs_momentum = _flt(r, ["rs_momentum", "rsMomentum", "y"])
-        raw_q = r.get("quadrant") or r.get("rrg_quadrant")
-        quadrant = (
-            RRGQuadrant(raw_q)
-            if raw_q in _RRG_QUADRANT_VALUES
-            else _quadrant_from_rs(rs_ratio, rs_momentum)
-        )
-        out.append(IndustryData(
-            name=str(name),
-            sector=item_sector or sector,
-            performance_1d=_flt(r, ["change_pct", "change", "perf_1d", "1d"]),
-            performance_5d=_flt(r, ["perf_5d", "5d"]),
-            quadrant=quadrant,
-            rs_ratio=rs_ratio,
-            rs_momentum=rs_momentum,
-        ))
-    return out
-
-
-def _parse_rrg(data: Any, url: str) -> list[dict]:
-    rows = _items(data, "rrg", "rrgData", "data", "result", "sectors", "industries")
-    out = []
-    for r in rows:
-        if not isinstance(r, dict):
-            continue
-        name = r.get("name") or r.get("sector") or r.get("industry") or r.get("symbol")
-        if not name:
-            continue
-        rs_ratio = _flt(r, ["rs_ratio", "rsRatio", "RS_Ratio", "x"])
-        rs_momentum = _flt(r, ["rs_momentum", "rsMomentum", "RS_Momentum", "y"])
-        raw_q = r.get("quadrant") or r.get("rrg_quadrant")
-        quadrant = (
-            raw_q
-            if raw_q in _RRG_QUADRANT_VALUES
-            else (_quadrant_from_rs(rs_ratio, rs_momentum).value if _quadrant_from_rs(rs_ratio, rs_momentum) else None)
-        )
-        out.append({"name": str(name), "rs_ratio": rs_ratio, "rs_momentum": rs_momentum, "quadrant": quadrant})
-    return out
-
-
-def _parse_stocks(data: Any, url: str) -> list[StockData]:
-    rows = _items(data, "stocks", "data", "result", "rows", "screenerData", "scanResult")
-    out = []
-    for r in rows:
-        if not isinstance(r, dict):
-            continue
-        ticker = (
-            r.get("symbol") or r.get("ticker") or r.get("Symbol")
-            or r.get("scrip") or r.get("NSE_Symbol") or r.get("nse_symbol")
-        )
-        if not ticker:
-            continue
-        circuit = _circuit_status(r)
-        out.append(StockData(
-            ticker=str(ticker).strip(),
-            name=r.get("company") or r.get("companyName") or r.get("name"),
-            sector=r.get("sector") or r.get("Sector"),
-            industry=r.get("industry") or r.get("Industry"),
-            price=_flt(r, ["price", "ltp", "lastPrice", "close", "CMP", "Last"]),
-            change_pct=_flt(r, ["change_pct", "changePct", "pChange", "change", "Change"]),
-            volume=_int(r, ["volume", "vol", "totalVolume", "Volume"]),
-            volume_20d_ma=_int(r, ["volume_20d_ma", "avg_volume_20d", "avgVolume20", "vol20dma", "avgVol20d"]),
-            circuit_status=circuit,
-            eps_growth_pct=_flt(r, ["eps_growth", "epsGrowth", "eps_growth_pct", "EPSGrowth"]),
-            revenue_growth_pct=_flt(r, ["revenue_growth", "revenueGrowth", "sales_growth", "SalesGrowth"]),
-            market_cap=_flt(r, ["market_cap", "marketCap", "mktCap"]),
-            pe_ratio=_flt(r, ["pe_ratio", "pe", "PE"]),
-        ))
-    return out
-
-
-def _parse_single_stock(data: Any, ticker: str) -> Optional[StockData]:
-    if not isinstance(data, dict):
-        return None
-    sym = data.get("symbol") or data.get("ticker") or data.get("scrip")
-    if not sym and not any(k in data for k in ("price", "ltp", "lastPrice", "volume", "close")):
-        return None
-    circuit = _circuit_status(data)
-    return StockData(
-        ticker=str(sym or ticker),
-        name=data.get("company") or data.get("companyName") or data.get("name"),
-        sector=data.get("sector"),
-        industry=data.get("industry"),
-        price=_flt(data, ["price", "ltp", "lastPrice", "close", "CMP"]),
-        change_pct=_flt(data, ["change_pct", "changePct", "pChange"]),
-        volume=_int(data, ["volume", "vol", "totalVolume"]),
-        volume_20d_ma=_int(data, ["volume_20d_ma", "avg_volume_20d", "avgVolume20"]),
-        circuit_status=circuit,
-        eps_growth_pct=_flt(data, ["eps_growth", "epsGrowth"]),
-        revenue_growth_pct=_flt(data, ["revenue_growth", "revenueGrowth", "salesGrowth"]),
-        market_cap=_flt(data, ["market_cap", "marketCap", "mktCap"]),
-        pe_ratio=_flt(data, ["pe_ratio", "pe", "PE"]),
-    )
-
-
-def _circuit_status(r: dict) -> Optional[str]:
-    raw = r.get("circuit") or r.get("circuit_status") or r.get("circuitStatus") or r.get("Circuit")
-    if raw is None:
-        return None
-    s = str(raw).lower()
-    if "upper" in s or s in ("uc", "u"):
-        return "Upper"
-    if "lower" in s or s in ("lc", "l"):
-        return "Lower"
-    if raw in (True, 1, "true", "yes", "1"):
-        return "Upper"
-    return None
-
-
-# ---- __NEXT_DATA__ extraction
-
-def _page_props(nd: dict) -> dict:
-    return nd.get("props", {}).get("pageProps", {})
-
-
-def _sectors_from_next_data(nd: dict) -> list[SectorData]:
-    props = _page_props(nd)
-    for k in ("sectors", "sectorData", "marketData", "data"):
-        if k in props:
-            r = _parse_sectors(props[k], "next_data")
-            if r:
-                return r
-    return []
-
-
-def _industries_from_next_data(nd: dict, sector: str) -> list[IndustryData]:
-    props = _page_props(nd)
-    for k in ("industries", "industryData", "data"):
-        if k in props:
-            r = _parse_industries(props[k], "next_data", sector)
-            if r:
-                return r
-    return []
-
-
-def _rrg_from_next_data(nd: dict) -> list[dict]:
-    props = _page_props(nd)
-    for k in ("rrg", "rrgData", "rotationData", "data"):
-        if k in props:
-            r = _parse_rrg(props[k], "next_data")
-            if r:
-                return r
-    return []
-
-
-def _stock_from_next_data(nd: dict, ticker: str) -> Optional[StockData]:
-    props = _page_props(nd)
-    for k in ("stock", "stockData", "stockInfo", "data"):
-        if k in props:
-            s = _parse_single_stock(props[k], ticker)
-            if s:
-                return s
-    return None
-
-
-# ---- DOM fallback
-
-async def _scrape_table(page: Page) -> list[StockData]:
-    stocks: list[StockData] = []
-    try:
-        rows = await page.locator("table tbody tr").all()
-        if not rows:
-            rows = await page.locator("[class*='stock-row'], [class*='stockRow'], [class*='scan-row']").all()
-        for row in rows:
-            cells = await row.locator("td").all()
-            texts = [await c.inner_text() for c in cells]
-            if len(texts) < 2:
-                continue
-            ticker = texts[0].strip()
-            if not ticker or len(ticker) > 20 or not ticker[0].isalpha():
-                continue
-            s = StockData(
-                ticker=ticker,
-                name=texts[1].strip() if len(texts) > 1 else None,
-                price=_safe_flt(texts[2]) if len(texts) > 2 else None,
-                change_pct=_safe_flt(texts[3]) if len(texts) > 3 else None,
-                volume=_safe_int(texts[4]) if len(texts) > 4 else None,
-                volume_20d_ma=_safe_int(texts[5]) if len(texts) > 5 else None,
-            )
-            stocks.append(s)
-    except Exception as e:
-        logger.warning("DOM table scrape failed: %s", e)
-    return stocks
-
-
-def _safe_flt(s: str) -> Optional[float]:
-    try:
-        return float(re.sub(r"[,%₹$]", "", s).strip())
-    except (ValueError, TypeError):
-        return None
-
-
-def _safe_int(s: str) -> Optional[int]:
-    try:
-        return int(float(re.sub(r"[,%₹$K]", "", s).strip()) * (1000 if s.strip().upper().endswith("K") else 1))
-    except (ValueError, TypeError):
-        return None
-
-
-# ---- filter logic
-
-def _apply_filters(
-    stocks: list[StockData],
-    sectors: list[str],
-    min_eps_growth_pct: float,
-    min_revenue_growth_pct: float,
-    min_volume_20d_ma: int,
-    exclude_circuit: bool,
-) -> list[StockData]:
-    out = []
-    for s in stocks:
-        if s.volume_20d_ma is not None and s.volume_20d_ma < min_volume_20d_ma:
-            continue
-        if exclude_circuit and s.circuit_status in ("Upper", "Lower"):
-            continue
-        if min_eps_growth_pct > 0 and (s.eps_growth_pct is None or s.eps_growth_pct < min_eps_growth_pct):
-            continue
-        if min_revenue_growth_pct > 0 and (s.revenue_growth_pct is None or s.revenue_growth_pct < min_revenue_growth_pct):
-            continue
-        if sectors and s.sector and not any(sec.lower() in s.sector.lower() for sec in sectors):
-            continue
-        out.append(s)
-    return out
-
-
-# ---- UI interaction helpers
-
-async def _try_set_filter(page: Page, value: str, selectors: list[str]) -> None:
-    for sel in selectors:
-        try:
-            el = page.locator(sel).first
-            if await el.count() == 0:
-                continue
-            tag = await el.evaluate("el => el.tagName.toLowerCase()")
-            if tag == "select":
-                await el.select_option(label=value)
-            else:
-                await el.click()
-                await page.keyboard.type(value)
-                # choose first autocomplete option
-                opt = page.locator(f"[role='option']:has-text('{value}'), li:has-text('{value}')").first
-                if await opt.count() > 0:
-                    await opt.click()
-                else:
-                    await page.keyboard.press("Enter")
-            await asyncio.sleep(0.4)
-            return
-        except Exception as e:
-            logger.debug("_try_set_filter(%s) failed: %s", sel, e)
-
-
-async def _try_fill_input(page: Page, value: str, selectors: list[str]) -> None:
-    for sel in selectors:
-        try:
-            el = page.locator(sel).first
-            if await el.count() == 0:
-                continue
-            await el.fill(value)
-            await asyncio.sleep(0.3)
-            return
-        except Exception as e:
-            logger.debug("_try_fill_input(%s) failed: %s", sel, e)
-
-
-async def _try_click(page: Page, selectors: list[str]) -> None:
-    for sel in selectors:
-        try:
-            el = page.locator(sel).first
-            if await el.count() == 0:
-                continue
-            await el.click()
-            return
-        except Exception as e:
-            logger.debug("_try_click(%s) failed: %s", sel, e)
+    if rs_momentum > 100:
+        return RRGQuadrant.IMPROVING
+    return RRGQuadrant.LAGGING
