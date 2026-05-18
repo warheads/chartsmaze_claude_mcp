@@ -283,18 +283,27 @@ class SingleChartWindow(tk.Toplevel):
 
         fig = plt.Figure(facecolor=BG)
         _draw_rank_perf_chart(fig, pool, period, get_rank, get_perf)
-        canvas = FigureCanvasTkAgg(fig, master=self)
+
+        chart_frame = tk.Frame(self, bg=BG)
+        chart_frame.pack(fill="both", expand=True)
+        canvas = FigureCanvasTkAgg(fig, master=chart_frame)
         canvas.get_tk_widget().configure(bg=BG, highlightthickness=0)
         canvas.get_tk_widget().pack(fill="both", expand=True)
-
-        def _on_resize(e, f=fig, c=canvas):
-            if e.width < 10 or e.height < 10:
-                return
-            f.set_size_inches(e.width / f.dpi, e.height / f.dpi, forward=False)
-            c.draw_idle()
-
-        canvas.get_tk_widget().bind("<Configure>", _on_resize)
         canvas.draw()
+
+        _resize_timer = [None]
+
+        def _on_resize(e, f=fig, c=canvas, fr=chart_frame):
+            if _resize_timer[0]:
+                self.after_cancel(_resize_timer[0])
+            def _do():
+                w, h = fr.winfo_width(), fr.winfo_height()
+                if w > 20 and h > 20:
+                    f.set_size_inches(w / f.dpi, h / f.dpi, forward=False)
+                    c.draw()
+            _resize_timer[0] = self.after(80, _do)
+
+        chart_frame.bind("<Configure>", _on_resize)
 
 
 # ── main window ────────────────────────────────────────────────────────────────
@@ -306,14 +315,17 @@ class ChartsMazeGUI(tk.Tk):
         self.configure(bg=BG)
         self.geometry("1400x860")
 
-        self._sectors:     list = []
-        self._industries:  dict[str, list] = {}
-        self._pool:        list = []
+        self._sectors:      list = []
+        self._industries:   dict[str, list] = {}
+        self._pool:         list = []
         self._chart_figs:     list = []
         self._chart_canvases: list = []
+        self._chart_frames:   list = []          # parent frames for resize sync
         self._detail_fig:    Optional["plt.Figure"] = None
         self._detail_canvas = None
-        self._sash_placed   = False
+        self._detail_frame:  Optional[tk.Frame] = None
+        self._sash_placed    = False
+        self._resize_timer   = None
 
         self._build()
 
@@ -335,6 +347,12 @@ class ChartsMazeGUI(tk.Tk):
             if h > 300:
                 self._sash_placed = True
                 self._paned.sash_place(0, 0, int(h * 0.40))
+                self.after(120, self._sync_chart_sizes)  # sync after sash settles
+        else:
+            # debounced sync on every window resize
+            if self._resize_timer:
+                self.after_cancel(self._resize_timer)
+            self._resize_timer = self.after(80, self._sync_chart_sizes)
 
     # ── layout ─────────────────────────────────────────────────────────────────
 
@@ -422,8 +440,11 @@ class ChartsMazeGUI(tk.Tk):
             tk.Label(pane, text="pip install matplotlib", bg=BG, fg=RED, font=_FONT).pack(expand=True)
             return
 
+        # chart_frame is the resize anchor — canvas fills it, we query its winfo size
+        chart_frame = tk.Frame(pane, bg=BG)
+        chart_frame.pack(fill="both", expand=True)
+
         fig = plt.Figure(facecolor=BG)
-        # placeholder annotation
         plt.rcParams.update(_MPL_RC)
         ax = fig.add_subplot(111)
         _style_axes(ax)
@@ -431,21 +452,14 @@ class ChartsMazeGUI(tk.Tk):
                 ha="center", va="center", color=FG2, fontsize=13)
         ax.set_xticks([]); ax.set_yticks([])
 
-        canvas = FigureCanvasTkAgg(fig, master=pane)
+        canvas = FigureCanvasTkAgg(fig, master=chart_frame)
         canvas.get_tk_widget().configure(bg=BG, highlightthickness=0)
         canvas.get_tk_widget().pack(fill="both", expand=True)
-
-        def _on_resize(e, f=fig, c=canvas):
-            if e.width < 10 or e.height < 10:
-                return
-            f.set_size_inches(e.width / f.dpi, e.height / f.dpi, forward=False)
-            c.draw_idle()
-
-        canvas.get_tk_widget().bind("<Configure>", _on_resize)
         canvas.draw()
 
         self._detail_fig    = fig
         self._detail_canvas = canvas
+        self._detail_frame  = chart_frame
 
     def _build_charts(self, parent: tk.Widget) -> None:
         lbl = tk.Frame(parent, bg=BG)
@@ -476,6 +490,7 @@ class ChartsMazeGUI(tk.Tk):
 
         self._chart_figs.clear()
         self._chart_canvases.clear()
+        self._chart_frames.clear()
 
         for period, get_rank, get_perf in _PERIODS:
             tab = tk.Frame(nb, bg=BG)
@@ -490,21 +505,18 @@ class ChartsMazeGUI(tk.Tk):
                 command=lambda p=period, gr=get_rank, gp=get_perf: self._expand(p, gr, gp),
             ).pack(side="left")
 
+            # chart_frame is the resize anchor
+            chart_frame = tk.Frame(tab, bg=BG)
+            chart_frame.pack(fill="both", expand=True)
+
             fig = plt.Figure(facecolor=BG)
-            canvas = FigureCanvasTkAgg(fig, master=tab)
+            canvas = FigureCanvasTkAgg(fig, master=chart_frame)
             canvas.get_tk_widget().configure(bg=BG, highlightthickness=0)
             canvas.get_tk_widget().pack(fill="both", expand=True)
 
-            def _on_resize(e, f=fig, c=canvas):
-                if e.width < 10 or e.height < 10:
-                    return
-                f.set_size_inches(e.width / f.dpi, e.height / f.dpi, forward=False)
-                c.draw_idle()
-
-            canvas.get_tk_widget().bind("<Configure>", _on_resize)
-
             self._chart_figs.append(fig)
             self._chart_canvases.append(canvas)
+            self._chart_frames.append(chart_frame)
 
     # ── data loading ───────────────────────────────────────────────────────────
 
@@ -553,6 +565,7 @@ class ChartsMazeGUI(tk.Tk):
 
         self._pool = self._collect_pool()
         self._redraw_tab_charts()
+        self.after(150, self._sync_chart_sizes)
 
         ch = self._sec_tree.get_children()
         if ch:
@@ -637,6 +650,20 @@ class ChartsMazeGUI(tk.Tk):
                     seen.add(i.name)
                     pool.append(i)
         return pool
+
+    def _sync_chart_sizes(self) -> None:
+        if not _HAS_MPL:
+            return
+        for fig, canvas, frame in zip(self._chart_figs, self._chart_canvases, self._chart_frames):
+            w, h = frame.winfo_width(), frame.winfo_height()
+            if w > 20 and h > 20:
+                fig.set_size_inches(w / fig.dpi, h / fig.dpi, forward=False)
+                canvas.draw()
+        if self._detail_fig and self._detail_canvas and self._detail_frame:
+            w, h = self._detail_frame.winfo_width(), self._detail_frame.winfo_height()
+            if w > 20 and h > 20:
+                self._detail_fig.set_size_inches(w / self._detail_fig.dpi, h / self._detail_fig.dpi, forward=False)
+                self._detail_canvas.draw()
 
     def _redraw_tab_charts(self) -> None:
         if not _HAS_MPL:
