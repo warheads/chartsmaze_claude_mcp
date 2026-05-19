@@ -502,6 +502,14 @@ def _extract_quarterly(row: dict) -> list[QuarterlyData]:
       • Date-tagged:  "EPS Dec25", "QoQ% EPS Sep25", "OPM Jun25 (%)"
       • Latest-N:     "EPS Latest", "EPS Latest-1", "Quarter Latest", …
     """
+    try:
+        return _extract_quarterly_inner(row)
+    except Exception:
+        logger.debug("_extract_quarterly failed for row %s", row.get("Stock Name"), exc_info=True)
+        return []
+
+
+def _extract_quarterly_inner(row: dict) -> list[QuarterlyData]:
     qtrs: dict[str, dict] = {}
 
     # ── Date-tagged columns ───────────────────────────────────────────────

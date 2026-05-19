@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+import traceback
 import tkinter as tk
 import webbrowser
 from tkinter import ttk
@@ -828,6 +829,8 @@ class ChartsMazeGUI(tk.Tk):
                        sorted(sectors, key=lambda s: s.rrg_score(), reverse=True),
                        all_inds, stocks, qtrs)
         except Exception as exc:
+            tb = traceback.format_exc()
+            print(tb, flush=True)   # visible in the terminal window
             self.after(0, self._on_error, str(exc))
 
     # ── UI updates ─────────────────────────────────────────────────────────────
