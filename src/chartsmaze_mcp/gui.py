@@ -18,6 +18,7 @@ import asyncio
 import os
 import threading
 import tkinter as tk
+import webbrowser
 from tkinter import ttk
 from typing import Optional
 
@@ -111,6 +112,18 @@ _IND_SORT_KEYS: dict = {
 _SEC_COLS = ["Sector", "Quad", "RS", "Mom", "Score"]
 _IND_COLS = ["Industry", "Quad", "RS", "Mom", "Trend",
              "R1W", "R1M", "R3M", "P1W%", "P1M%", "P3M%", "52W Hi%"]
+
+_STK_SORT_KEYS: dict = {
+    "Stock":    lambda s: s.ticker.lower(),
+    "RS":       lambda s: s.rs_rating        or 0.0,
+    "Industry": lambda s: (s.industry or "").lower(),
+    "1M%":      lambda s: s.returns_1m       or 0.0,
+    "3M%":      lambda s: s.returns_3m       or 0.0,
+    "52W Hi%":  lambda s: s.from_52w_high_pct or 0.0,
+    "Sector":   lambda s: (s.sector or "").lower(),
+}
+_STK_COLS = ["Stock", "RS", "Industry", "1M%", "3M%", "52W Hi%", "Sector"]
+_QTR_COLS = ["Quarter", "EPS", "QoQ EPS", "YoY EPS", "Sales", "QoQ Sales", "YoY Sales", "OPM"]
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -345,20 +358,33 @@ class ChartsMazeGUI(tk.Tk):
         self.configure(bg=BG)
         self.geometry("1400x860")
 
-        self._sectors:        list = []
-        self._industries:     dict[str, list] = {}
-        self._pool:           list = []
-        self._displayed_inds: list = []
-        self._chart_figs:     list = []
-        self._chart_canvases: list = []
-        self._chart_frames:   list = []
-        self._detail_fig:     Optional["plt.Figure"] = None
-        self._detail_canvas   = None
-        self._detail_frame:   Optional[tk.Frame] = None
-        self._sash_placed     = False
-        self._resize_timer    = None
-        self._sec_sort:       tuple = ("Score", True)
-        self._ind_sort:       tuple = ("Trend", True)
+        self._sectors:              list = []
+        self._industries:           dict[str, list] = {}
+        self._pool:                 list = []
+        self._displayed_inds:       list = []
+        self._stocks_by_industry:   dict[str, list] = {}
+        self._quarterly:            dict[str, list] = {}
+        self._displayed_stocks:     list = []
+        self._chart_figs:           list = []
+        self._chart_canvases:       list = []
+        self._chart_frames:         list = []
+        self._detail_fig:           Optional["plt.Figure"] = None
+        self._detail_canvas         = None
+        self._detail_frame:         Optional[tk.Frame] = None
+        self._sash_placed           = False
+        self._resize_timer          = None
+        self._sec_sort:             tuple = ("Score", True)
+        self._ind_sort:             tuple = ("Trend", True)
+        self._stk_sort:             tuple = ("RS",    True)
+        # Stocks-tab widget handles (set in _build_stocks_tab)
+        self._stk_sec_tree          = None
+        self._stk_ind_tree          = None
+        self._stk_tree              = None
+        self._qtr_tree              = None
+        self._ind_fund_vars:        dict  = {}
+        self._stk_metric_vars:      dict  = {}
+        self._stk_vpane             = None
+        self._stk_sash_placed       = False
 
         self._build()
 
@@ -407,12 +433,39 @@ class ChartsMazeGUI(tk.Tk):
         self._btn.pack(side="right")
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
 
+        # top-level notebook
+        s = ttk.Style()
+        s.configure("Amoled.TNotebook", background=BG, borderwidth=0)
+        s.configure("Amoled.TNotebook.Tab",
+            background=CARD, foreground=FG2, padding=[22, 7], font=_FONT_BOLD)
+        s.map("Amoled.TNotebook.Tab",
+            background=[("selected", BORDER)],
+            foreground=[("selected", ACCENT)])
+        self._top_nb = ttk.Notebook(self, style="Amoled.TNotebook")
+        self._top_nb.pack(fill="both", expand=True, padx=10, pady=(8, 0))
+
+        market_tab = tk.Frame(self._top_nb, bg=BG)
+        self._top_nb.add(market_tab, text="   Market   ")
+        self._build_market_tab(market_tab)
+
+        stocks_tab = tk.Frame(self._top_nb, bg=BG)
+        self._top_nb.add(stocks_tab, text="   Stocks   ")
+        self._build_stocks_tab(stocks_tab)
+
+        # status bar
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
+        self._score_bar = tk.Label(
+            self, text="", bg=BG, fg=FG2, font=_FONT_SM, anchor="w", pady=4,
+        )
+        self._score_bar.pack(fill="x", padx=16)
+
+    def _build_market_tab(self, parent: tk.Frame) -> None:
         # vertical PanedWindow
         self._paned = tk.PanedWindow(
-            self, orient="vertical", bg=BG,
+            parent, orient="vertical", bg=BG,
             sashwidth=6, sashrelief="flat", sashpad=0,
         )
-        self._paned.pack(fill="both", expand=True, padx=10, pady=(8, 0))
+        self._paned.pack(fill="both", expand=True)
 
         # ── top pane: 3 columns ──
         top = tk.Frame(self._paned, bg=BG)
@@ -429,12 +482,168 @@ class ChartsMazeGUI(tk.Tk):
         self._paned.add(bot, stretch="always", minsize=200)
         self._build_charts(bot)
 
-        # status bar
-        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
-        self._score_bar = tk.Label(
-            self, text="", bg=BG, fg=FG2, font=_FONT_SM, anchor="w", pady=4,
+    def _build_stocks_tab(self, parent: tk.Frame) -> None:
+        hpane = tk.PanedWindow(parent, orient="horizontal", bg=BG,
+                               sashwidth=5, sashrelief="flat", sashpad=0)
+        hpane.pack(fill="both", expand=True)
+
+        # Left: sector list
+        sf = tk.Frame(hpane, bg=BG, width=200)
+        hpane.add(sf, minsize=140, stretch="never")
+        tk.Label(sf, text="SECTORS", bg=BG, fg=FG2, font=_FONT_SM).pack(
+            anchor="w", padx=6, pady=(4, 2))
+        self._stk_sec_tree = _styled_tree(sf, ["Sector", "Quad"], [130, 72])
+        self._stk_sec_tree.bind("<<TreeviewSelect>>", self._on_stk_sector_select)
+
+        # Middle: industry list
+        inf = tk.Frame(hpane, bg=BG, width=230)
+        hpane.add(inf, minsize=150, stretch="never")
+        tk.Label(inf, text="INDUSTRIES", bg=BG, fg=FG2, font=_FONT_SM).pack(
+            anchor="w", padx=6, pady=(4, 2))
+        self._stk_ind_tree = _styled_tree(inf, ["Industry", "Trend"], [160, 66])
+        self._stk_ind_tree.bind("<<TreeviewSelect>>", self._on_stk_industry_select)
+
+        # Right: vertical split — stock list (top) + fundamentals (bottom)
+        rf = tk.Frame(hpane, bg=BG)
+        hpane.add(rf, stretch="always")
+        self._stk_vpane = tk.PanedWindow(rf, orient="vertical", bg=BG,
+                                          sashwidth=5, sashrelief="flat")
+        self._stk_vpane.pack(fill="both", expand=True)
+
+        # Stock list
+        sl = tk.Frame(self._stk_vpane, bg=BG)
+        self._stk_vpane.add(sl, stretch="always", minsize=120)
+        self._build_stock_list(sl)
+
+        # Fundamentals row
+        fl = tk.Frame(self._stk_vpane, bg=BG)
+        self._stk_vpane.add(fl, stretch="always", minsize=140)
+        self._build_fund_split(fl)
+
+    def _build_stock_list(self, parent: tk.Frame) -> None:
+        bar = tk.Frame(parent, bg=BG)
+        bar.pack(fill="x", padx=6, pady=(4, 0))
+        tk.Label(bar, text="STOCKS", bg=BG, fg=FG2, font=_FONT_SM).pack(side="left")
+        tk.Button(
+            bar, text="⤢  Open Chart",
+            bg=CARD, fg=ACCENT, activebackground=BORDER, activeforeground=ACCENT,
+            relief="flat", font=_FONT_SM, padx=10, pady=3, cursor="hand2",
+            command=self._open_tv_chart,
+        ).pack(side="right")
+        self._stk_tree = _styled_tree(
+            parent, _STK_COLS,
+            widths=[120, 52, 160, 62, 62, 72, 120],
         )
-        self._score_bar.pack(fill="x", padx=16)
+        for col in _STK_COLS:
+            self._stk_tree.heading(col, command=lambda c=col: self._sort_stock(c))
+        self._stk_tree.bind("<<TreeviewSelect>>", self._on_stock_select)
+        self._stk_tree.bind("<Double-1>", self._on_stock_dbl)
+        # heading indicator for default sort
+        self._stk_tree.heading("RS", text="RS ▼")
+
+    def _build_fund_split(self, parent: tk.Frame) -> None:
+        hpane = tk.PanedWindow(parent, orient="horizontal", bg=BG,
+                               sashwidth=5, sashrelief="flat")
+        hpane.pack(fill="both", expand=True)
+
+        # Left: industry/sector fundamental
+        lf = tk.Frame(hpane, bg=BG)
+        hpane.add(lf, stretch="always", minsize=200)
+        self._build_ind_fund_panel(lf)
+
+        # Right: stock fundamental (quarterly table + metric cards)
+        rf = tk.Frame(hpane, bg=BG)
+        hpane.add(rf, stretch="always", minsize=260)
+        self._build_stock_fund_panel(rf)
+
+    def _build_ind_fund_panel(self, parent: tk.Frame) -> None:
+        tk.Label(parent, text="SECTOR / INDUSTRY FUNDAMENTAL",
+                 bg=BG, fg=FG2, font=_FONT_SM).pack(anchor="w", padx=6, pady=(6, 4))
+        scroll_wrap = tk.Frame(parent, bg=SURFACE)
+        scroll_wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        canvas = tk.Canvas(scroll_wrap, bg=SURFACE, highlightthickness=0)
+        sb = ttk.Scrollbar(scroll_wrap, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(canvas, bg=SURFACE)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        def _on_inner_conf(e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfig(win, width=canvas.winfo_width())
+        inner.bind("<Configure>", _on_inner_conf)
+
+        fields = [
+            ("Name",         "name"),
+            ("Sector",       "sector"),
+            ("Quadrant",     "quadrant"),
+            ("RS Ratio",     "rs_ratio"),
+            ("RS Momentum",  "rs_momentum"),
+            ("Perf 1W%",     "perf_1w"),
+            ("Perf 1M%",     "perf_1m"),
+            ("Perf 3M%",     "perf_3m"),
+            ("Rank 1W",      "rank_1w"),
+            ("Rank 1M",      "rank_1m"),
+            ("Rank 3M",      "rank_3m"),
+            ("Market Cap",   "market_cap"),
+            ("Stocks",       "stock_count"),
+            ("52W Hi%",      "from_52w_high_pct"),
+        ]
+        self._ind_fund_vars = {}
+        for label, key in fields:
+            row = tk.Frame(inner, bg=SURFACE)
+            row.pack(fill="x", padx=10, pady=2)
+            tk.Label(row, text=label + ":", bg=SURFACE, fg=FG2,
+                     font=_FONT_SM, width=14, anchor="w").pack(side="left")
+            var = tk.StringVar(value="—")
+            self._ind_fund_vars[key] = var
+            tk.Label(row, textvariable=var, bg=SURFACE, fg=FG,
+                     font=_FONT_SM, anchor="w").pack(side="left")
+
+    def _build_stock_fund_panel(self, parent: tk.Frame) -> None:
+        tk.Label(parent, text="FUNDAMENTAL & TECHNICAL PARAMETERS",
+                 bg=BG, fg=ACCENT, font=_FONT_BOLD).pack(pady=(8, 4))
+
+        # Quarterly treeview (fixed height = 4 rows, not expanding)
+        qtree_wrap = tk.Frame(parent, bg=BG)
+        qtree_wrap.pack(fill="x", padx=6, pady=(0, 4))
+        uid = f"QTR{id(qtree_wrap)}.Treeview"
+        s = ttk.Style()
+        s.configure(uid, background=CARD, foreground=FG, fieldbackground=CARD,
+                    rowheight=26, font=_FONT_SM, borderwidth=0)
+        s.configure(f"{uid}.Heading", background=SURFACE, foreground=ACCENT,
+                    relief="flat", font=_FONT_SM)
+        s.map(uid, background=[("selected", BORDER)], foreground=[("selected", ACCENT)])
+        qwidths = [62, 52, 62, 62, 52, 72, 72, 55]
+        self._qtr_tree = ttk.Treeview(
+            qtree_wrap, columns=_QTR_COLS, show="headings",
+            style=uid, height=4, selectmode="none",
+        )
+        for col, w in zip(_QTR_COLS, qwidths):
+            self._qtr_tree.heading(col, text=col)
+            self._qtr_tree.column(col, width=w, minwidth=w, anchor="center", stretch=True)
+        self._qtr_tree.pack(fill="x")
+
+        # Metric cards
+        cards = tk.Frame(parent, bg=BG)
+        cards.pack(fill="x", padx=6, pady=4)
+        self._stk_metric_vars = {}
+        metrics = [
+            ("Market Cap (Cr)",    "market_cap"),
+            ("% from 52W High",    "from_52w_high_pct"),
+            ("1M Returns%",        "returns_1m"),
+            ("3M Returns%",        "returns_3m"),
+        ]
+        for i, (label, key) in enumerate(metrics):
+            card = tk.Frame(cards, bg=CARD, padx=10, pady=10)
+            card.grid(row=0, column=i, sticky="nsew", padx=3, pady=3)
+            cards.columnconfigure(i, weight=1)
+            tk.Label(card, text=label, bg=CARD, fg=FG2, font=_FONT_SM).pack()
+            var = tk.StringVar(value="—")
+            self._stk_metric_vars[key] = var
+            clr = ACCENT
+            tk.Label(card, textvariable=var, bg=CARD, fg=clr,
+                     font=_FONT_BOLD).pack()
 
     def _build_sector_panel(self, parent: tk.Widget) -> None:
         pane = tk.Frame(parent, bg=BG, width=390)
@@ -559,8 +768,15 @@ class ChartsMazeGUI(tk.Tk):
         self._btn.config(state="disabled")
         self._status_var.set("Loading data — this may take ~30 s…")
         self._sectors = []; self._industries = {}; self._pool = []; self._displayed_inds = []
+        self._stocks_by_industry = {}; self._quarterly = {}; self._displayed_stocks = []
         self._sec_tree.delete(*self._sec_tree.get_children())
         self._ind_tree.delete(*self._ind_tree.get_children())
+        if self._stk_sec_tree:
+            self._stk_sec_tree.delete(*self._stk_sec_tree.get_children())
+        if self._stk_ind_tree:
+            self._stk_ind_tree.delete(*self._stk_ind_tree.get_children())
+        if self._stk_tree:
+            self._stk_tree.delete(*self._stk_tree.get_children())
         threading.Thread(target=self._worker, daemon=True).start()
 
     def _worker(self) -> None:
@@ -570,21 +786,26 @@ class ChartsMazeGUI(tk.Tk):
             async with ChartsMazeClient(session_cookie=os.environ.get("CHARTSMAZE_SESSION")) as cm:
                 sectors  = await cm.get_sector_analysis()
                 all_inds = {s.name: await cm.get_industry_analysis(s.name) for s in sectors}
-                return sectors, all_inds
+                stocks   = await cm.get_stocks_grouped_by_industry()
+                qtrs     = await cm.get_all_quarterly_data()
+                return sectors, all_inds, stocks, qtrs
 
         try:
-            sectors, all_inds = asyncio.run(_run())
+            sectors, all_inds, stocks, qtrs = asyncio.run(_run())
             self.after(0, self._on_data,
                        sorted(sectors, key=lambda s: s.rrg_score(), reverse=True),
-                       all_inds)
+                       all_inds, stocks, qtrs)
         except Exception as exc:
             self.after(0, self._on_error, str(exc))
 
     # ── UI updates ─────────────────────────────────────────────────────────────
 
-    def _on_data(self, sectors: list, all_inds: dict) -> None:
-        self._sectors    = sectors
-        self._industries = all_inds
+    def _on_data(self, sectors: list, all_inds: dict,
+                 stocks: dict, qtrs: dict) -> None:
+        self._sectors              = sectors
+        self._industries           = all_inds
+        self._stocks_by_industry   = stocks
+        self._quarterly            = qtrs
 
         self._populate_sector_tree(sectors)
 
@@ -595,6 +816,9 @@ class ChartsMazeGUI(tk.Tk):
         self._pool = self._collect_pool()
         self._redraw_tab_charts()
         self.after(150, self._sync_chart_sizes)
+
+        # Populate Stocks-tab sector/industry lists
+        self._populate_stk_sector_tree(sectors)
 
         # Select first real sector (index 1, after the "ALL" row)
         ch = self._sec_tree.get_children()
@@ -661,6 +885,188 @@ class ChartsMazeGUI(tk.Tk):
             _draw_detail_chart(self._detail_fig, ind)
             self._detail_canvas.draw()
             self.after(80, self._sync_chart_sizes)
+
+    # ── stocks tab helpers ─────────────────────────────────────────────────────
+
+    def _populate_stk_sector_tree(self, sectors: list) -> None:
+        if not self._stk_sec_tree:
+            return
+        self._stk_sec_tree.delete(*self._stk_sec_tree.get_children())
+        self._stk_sec_tree.insert("", "end", iid="__ALL__", tags=("all",),
+                                  values=("▶  ALL", "—"))
+        for s in sectors:
+            quad = s.quadrant.value if s.quadrant else "—"
+            self._stk_sec_tree.insert("", "end", iid=f"ss_{s.name}",
+                tags=(quad if quad in _QUAD_FG else "dim",),
+                values=(s.name, quad))
+        ch = self._stk_sec_tree.get_children()
+        if len(ch) > 1:
+            self._stk_sec_tree.selection_set(ch[1])
+
+    def _on_stk_sector_select(self, _e: tk.Event) -> None:
+        sel = self._stk_sec_tree.selection() if self._stk_sec_tree else ()
+        if not sel:
+            return
+        iid = sel[0]
+        if self._stk_ind_tree:
+            self._stk_ind_tree.delete(*self._stk_ind_tree.get_children())
+        if iid == "__ALL__":
+            inds: list = []
+            seen: set[str] = set()
+            for lst in self._industries.values():
+                for i in lst:
+                    if i.name not in seen:
+                        seen.add(i.name); inds.append(i)
+        else:
+            sector_name = iid[3:]
+            inds = self._industries.get(sector_name, [])
+        if self._stk_ind_tree:
+            for i in sorted(inds, key=lambda x: x.trend_score(), reverse=True):
+                quad = i.quadrant.value if i.quadrant else "—"
+                self._stk_ind_tree.insert("", "end", iid=f"si_{i.name}",
+                    tags=(quad if quad in _QUAD_FG else "dim",),
+                    values=(i.name, _fmt(i.trend_score(), 0)))
+            ch2 = self._stk_ind_tree.get_children()
+            if ch2:
+                self._stk_ind_tree.selection_set(ch2[0])
+
+    def _on_stk_industry_select(self, _e: tk.Event) -> None:
+        sel = self._stk_ind_tree.selection() if self._stk_ind_tree else ()
+        if not sel:
+            return
+        iid = sel[0]
+        ind_name = iid[3:]
+        # Gather stocks for this industry
+        stocks = self._stocks_by_industry.get(ind_name, [])
+        self._populate_stock_list(stocks)
+        # Update industry fundamentals
+        sec_sel = self._stk_sec_tree.selection() if self._stk_sec_tree else ()
+        if sec_sel:
+            sec_iid = sec_sel[0]
+            if sec_iid != "__ALL__":
+                sector_name = sec_iid[3:]
+                inds = self._industries.get(sector_name, [])
+                ind_obj = next((i for i in inds if i.name == ind_name), None)
+                if ind_obj:
+                    self._update_ind_fundamentals(ind_obj)
+
+    def _populate_stock_list(self, stocks: list) -> None:
+        if not self._stk_tree:
+            return
+        col, rev = self._stk_sort
+        key = _STK_SORT_KEYS.get(col)
+        ordered = sorted(stocks, key=key, reverse=rev) if key else list(stocks)
+        self._displayed_stocks = ordered
+        self._stk_tree.delete(*self._stk_tree.get_children())
+        for s in ordered:
+            perf1m = _fmt(s.returns_1m, suffix="%")
+            perf3m = _fmt(s.returns_3m, suffix="%")
+            hi52   = _fmt(s.from_52w_high_pct, suffix="%")
+            self._stk_tree.insert("", "end",
+                tags=("dim",),
+                values=(
+                    s.ticker,
+                    _fmt(s.rs_rating, 0) if s.rs_rating is not None else "—",
+                    s.industry or "—",
+                    perf1m, perf3m, hi52,
+                    s.sector or "—",
+                ),
+            )
+        # Refresh heading indicators
+        for c in _STK_COLS:
+            ind = (" ▼" if rev else " ▲") if c == col else ""
+            self._stk_tree.heading(c, text=c + ind,
+                                   command=lambda cc=c: self._sort_stock(cc))
+
+    def _sort_stock(self, col: str) -> None:
+        cur_col, cur_rev = self._stk_sort
+        self._stk_sort = (col, not cur_rev if col == cur_col else True)
+        self._populate_stock_list(self._displayed_stocks)
+
+    def _on_stock_select(self, _e: tk.Event) -> None:
+        if not self._stk_tree:
+            return
+        sel = self._stk_tree.selection()
+        if not sel:
+            return
+        idx = self._stk_tree.index(sel[0])
+        if idx >= len(self._displayed_stocks):
+            return
+        stock = self._displayed_stocks[idx]
+        self._update_stock_fundamentals(stock)
+        self._score_bar.config(
+            text=(f"{stock.ticker}  •  {stock.name or ''}  •  "
+                  f"RS {_fmt(stock.rs_rating, 0)}  •  "
+                  f"1M {_fmt(stock.returns_1m, suffix='%')}  "
+                  f"3M {_fmt(stock.returns_3m, suffix='%')}  "
+                  f"52W Hi {_fmt(stock.from_52w_high_pct, suffix='%')}")
+        )
+
+    def _on_stock_dbl(self, event: tk.Event) -> None:
+        self._open_tv_chart()
+
+    def _open_tv_chart(self) -> None:
+        if not self._stk_tree:
+            return
+        sel = self._stk_tree.selection()
+        if not sel:
+            return
+        idx = self._stk_tree.index(sel[0])
+        if idx >= len(self._displayed_stocks):
+            return
+        ticker = self._displayed_stocks[idx].ticker
+        url = f"https://www.tradingview.com/chart/?symbol=NSE:{ticker}"
+        webbrowser.open(url)
+
+    def _update_ind_fundamentals(self, obj) -> None:
+        if not self._ind_fund_vars:
+            return
+        is_ind = hasattr(obj, "rank_1w")
+        vals = {
+            "name":             obj.name,
+            "sector":           obj.sector if is_ind else "—",
+            "quadrant":         obj.quadrant.value if obj.quadrant else "—",
+            "rs_ratio":         _fmt(obj.rs_ratio),
+            "rs_momentum":      _fmt(obj.rs_momentum),
+            "perf_1w":          _fmt(getattr(obj, "performance_1w", None), suffix="%"),
+            "perf_1m":          _fmt(getattr(obj, "performance_1m", None), suffix="%"),
+            "perf_3m":          _fmt(getattr(obj, "performance_3m", None), suffix="%"),
+            "rank_1w":          str(obj.rank_1w) if is_ind and obj.rank_1w else "—",
+            "rank_1m":          str(obj.rank_1m) if is_ind and obj.rank_1m else "—",
+            "rank_3m":          str(obj.rank_3m) if is_ind and obj.rank_3m else "—",
+            "market_cap":       _fmt(getattr(obj, "market_cap", None), 0),
+            "stock_count":      str(obj.stock_count) if obj.stock_count else "—",
+            "from_52w_high_pct": _fmt(getattr(obj, "from_52w_high_pct", None), suffix="%"),
+        }
+        for key, var in self._ind_fund_vars.items():
+            var.set(vals.get(key, "—"))
+
+    def _update_stock_fundamentals(self, stock) -> None:
+        # Metric cards
+        for key, var in self._stk_metric_vars.items():
+            val = getattr(stock, key, None)
+            if val is None:
+                var.set("—")
+            elif key == "market_cap":
+                var.set(_fmt(val, 0))
+            else:
+                var.set(_fmt(val, 1, "%"))
+        # Quarterly table
+        if not self._qtr_tree:
+            return
+        self._qtr_tree.delete(*self._qtr_tree.get_children())
+        qtrs = self._quarterly.get(stock.ticker, [])
+        for q in qtrs:
+            self._qtr_tree.insert("", "end", values=(
+                q.quarter,
+                _fmt(q.eps, 2) if q.eps is not None else "—",
+                _fmt(q.qoq_eps, 1) if q.qoq_eps is not None else "—",
+                _fmt(q.yoy_eps, 1) if q.yoy_eps is not None else "—",
+                _fmt(q.sales, 2) if q.sales is not None else "—",
+                _fmt(q.qoq_sales, 1) if q.qoq_sales is not None else "—",
+                _fmt(q.yoy_sales, 1) if q.yoy_sales is not None else "—",
+                _fmt(q.opm, 2) if q.opm is not None else "—",
+            ))
 
     # ── sort / populate helpers ────────────────────────────────────────────────
 

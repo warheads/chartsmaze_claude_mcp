@@ -24,12 +24,13 @@ import csv
 import gzip
 import io
 import logging
+import re
 from typing import Any, Optional
 
 import httpx
 from playwright.async_api import Browser, BrowserContext, async_playwright
 
-from .models import IndustryData, RRGQuadrant, SectorData, StockData
+from .models import IndustryData, QuarterlyData, RRGQuadrant, SectorData, StockData
 
 logger = logging.getLogger(__name__)
 
@@ -62,9 +63,25 @@ _COL_RS_RATING     = "RS Rating"
 _COL_EXCHANGE      = "Exchange"
 
 # Column aliases used in fundamental CSV.
-_COL_EPS_YOY  = "YoY % EPS Latest"
+_COL_EPS_YOY   = "YoY % EPS Latest"
 _COL_SALES_YOY = "YoY % Sales Latest"
 _COL_PE        = "P/E"
+
+# Extended columns from rs_filter.gz (may vary by data version).
+_COL_RETURNS_1M   = "1 Month Returns(%)"
+_COL_RETURNS_3M   = "3 Month Returns(%)"
+_COL_52W_HIGH_PCT = "% from 52W High"
+
+# Quarterly parser constants.
+_MONTH_IDX: dict[str, int] = {
+    m: i for i, m in enumerate(
+        ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    )
+}
+_QTR_RE = re.compile(
+    r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[- ]?(\d{2,4})\b',
+    re.IGNORECASE,
+)
 
 
 class ChartsMazeClient:
@@ -350,6 +367,52 @@ class ChartsMazeClient:
             )
         return None
 
+    async def get_stocks_grouped_by_industry(self) -> dict[str, list[StockData]]:
+        """Return every stock keyed by Basic Industry, with extended fields."""
+        await self._ensure_data()
+        rs_rows   = self._parsed.get("rs_filter", [])
+        fund_rows = self._parsed.get("fundamental", [])
+        fund_map: dict[str, dict] = {r[_COL_TICKER]: r for r in fund_rows if r.get(_COL_TICKER)}
+
+        result: dict[str, list[StockData]] = {}
+        for r in rs_rows:
+            ticker = r.get(_COL_TICKER, "").strip()
+            if not ticker:
+                continue
+            sec = r.get(_COL_SECTOR, "").strip()
+            ind = r.get(_COL_INDUSTRY, "").strip()
+            f   = fund_map.get(ticker, {})
+            vol_20d = _flt(r.get(_COL_VOL_20D_MA))
+            result.setdefault(ind or "—", []).append(StockData(
+                ticker=ticker,
+                name=r.get(_COL_COMPANY) or ticker,
+                sector=sec or None,
+                industry=ind or None,
+                price=_flt(r.get(_COL_PRICE)),
+                change_pct=_flt(r.get(_COL_CHANGE_1D)),
+                volume_20d_ma=int(vol_20d) if vol_20d is not None else None,
+                eps_growth_pct=_flt(f.get(_COL_EPS_YOY)),
+                revenue_growth_pct=_flt(f.get(_COL_SALES_YOY)),
+                market_cap=_flt(r.get(_COL_MARKET_CAP)),
+                pe_ratio=_flt(f.get(_COL_PE)) if f else None,
+                rs_rating=_flt(r.get(_COL_RS_RATING)),
+                returns_1m=_flt(r.get(_COL_RETURNS_1M)),
+                returns_3m=_flt(r.get(_COL_RETURNS_3M)),
+                from_52w_high_pct=_flt(r.get(_COL_52W_HIGH_PCT)),
+            ))
+        for lst in result.values():
+            lst.sort(key=lambda s: s.rs_rating or 0.0, reverse=True)
+        return result
+
+    async def get_all_quarterly_data(self) -> dict[str, list[QuarterlyData]]:
+        """Return {ticker: [QuarterlyData, ...]} for all tickers in fundamental.gz."""
+        await self._ensure_data()
+        return {
+            r[_COL_TICKER]: _extract_quarterly(r)
+            for r in self._parsed.get("fundamental", [])
+            if r.get(_COL_TICKER)
+        }
+
     async def discover_api_calls(self, url: str) -> list[dict]:
         """Load *url* and return the .gz data-file URLs the page requests."""
         gz_urls = await self._discover_gz_urls(url)
@@ -417,6 +480,102 @@ class ChartsMazeClient:
 
 
 # ============================================================ helpers
+
+def _extract_quarterly(row: dict) -> list[QuarterlyData]:
+    """
+    Parse quarterly EPS / Sales / OPM from a fundamental row.
+
+    Handles two common ChartsMaze naming conventions:
+      • Date-tagged:  "EPS Dec25", "QoQ% EPS Sep25", "OPM Jun25 (%)"
+      • Latest-N:     "EPS Latest", "EPS Latest-1", "Quarter Latest", …
+    """
+    qtrs: dict[str, dict] = {}
+
+    # ── Date-tagged columns ───────────────────────────────────────────────
+    for col, raw in row.items():
+        m = _QTR_RE.search(col)
+        if not m:
+            continue
+        val = _flt(raw)
+        if val is None:
+            continue
+        mon = m.group(1).capitalize()
+        yr  = m.group(2)[-2:]
+        key = f"{mon} {yr}"
+        q   = qtrs.setdefault(key, {})
+        cl  = col.lower()
+        if "opm" in cl or "operating" in cl:
+            q.setdefault("opm", val)
+        elif ("qoq" in cl or "q-o-q" in cl) and (
+                "sales" in cl or "revenue" in cl or "turnover" in cl):
+            q.setdefault("qoq_sales", val)
+        elif ("yoy" in cl or "y-o-y" in cl) and (
+                "sales" in cl or "revenue" in cl or "turnover" in cl):
+            q.setdefault("yoy_sales", val)
+        elif "sales" in cl or "revenue" in cl or "turnover" in cl:
+            q.setdefault("sales", val)
+        elif ("qoq" in cl or "q-o-q" in cl) and "eps" in cl:
+            q.setdefault("qoq_eps", val)
+        elif ("yoy" in cl or "y-o-y" in cl) and "eps" in cl:
+            q.setdefault("yoy_eps", val)
+        elif "eps" in cl:
+            q.setdefault("eps", val)
+
+    # ── Latest-N columns (fallback when no date tags found) ───────────────
+    if not qtrs:
+        latest_re = re.compile(r'Latest(?:-(\d+))?$', re.I)
+        quarter_labels: dict[int, str] = {}
+        for col, raw in row.items():
+            lm = latest_re.search(col)
+            if not lm:
+                continue
+            n = int(lm.group(1) or 0)
+            cl = col.lower()
+            if "quarter" in cl:
+                quarter_labels[n] = str(raw).strip()
+                continue
+            val = _flt(raw)
+            if val is None:
+                continue
+            key = f"Latest-{n}"
+            q   = qtrs.setdefault(key, {})
+            if "opm" in cl or "operating" in cl:
+                q.setdefault("opm", val)
+            elif ("qoq" in cl or "q-o-q" in cl) and (
+                    "sales" in cl or "revenue" in cl or "turnover" in cl):
+                q.setdefault("qoq_sales", val)
+            elif ("yoy" in cl or "y-o-y" in cl) and (
+                    "sales" in cl or "revenue" in cl or "turnover" in cl):
+                q.setdefault("yoy_sales", val)
+            elif "sales" in cl or "revenue" in cl or "turnover" in cl:
+                q.setdefault("sales", val)
+            elif ("qoq" in cl or "q-o-q" in cl) and "eps" in cl:
+                q.setdefault("qoq_eps", val)
+            elif ("yoy" in cl or "y-o-y" in cl) and "eps" in cl:
+                q.setdefault("yoy_eps", val)
+            elif "eps" in cl:
+                q.setdefault("eps", val)
+        # Replace generic keys with real quarter labels if available
+        relabelled: dict[str, dict] = {}
+        for key, q in qtrs.items():
+            lm2 = re.search(r'\d+$', key)
+            n2  = int(lm2.group()) if lm2 else 0
+            label = quarter_labels.get(n2, key)
+            relabelled[label] = q
+        qtrs = relabelled
+
+    # Sort most-recent first using month index, fall back to string sort
+    def _qkey(k: str) -> tuple:
+        parts = k.split()
+        if len(parts) == 2 and parts[0] in _MONTH_IDX:
+            return (int(parts[1]), _MONTH_IDX[parts[0]])
+        return (0, 0)
+
+    return [
+        QuarterlyData(quarter=k, **v)
+        for k in sorted(qtrs, key=_qkey, reverse=True)
+    ][:4]
+
 
 def _flt(v: Any) -> Optional[float]:
     if v is None:

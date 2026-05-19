@@ -13,6 +13,17 @@ class RRGQuadrant(str, Enum):
     IMPROVING = "Improving"
 
 
+class QuarterlyData(BaseModel):
+    quarter:    str
+    eps:        Optional[float] = None
+    qoq_eps:    Optional[float] = None
+    yoy_eps:    Optional[float] = None
+    sales:      Optional[float] = None
+    qoq_sales:  Optional[float] = None
+    yoy_sales:  Optional[float] = None
+    opm:        Optional[float] = None
+
+
 class SectorData(BaseModel):
     name: str
     performance_1d:       Optional[float] = None
@@ -171,3 +182,7 @@ class StockData(BaseModel):
     revenue_growth_pct:  Optional[float] = None
     market_cap:          Optional[float] = None
     pe_ratio:            Optional[float] = None
+    rs_rating:           Optional[float] = None
+    returns_1m:          Optional[float] = None
+    returns_3m:          Optional[float] = None
+    from_52w_high_pct:   Optional[float] = None
