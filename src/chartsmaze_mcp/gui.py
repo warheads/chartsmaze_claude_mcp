@@ -421,6 +421,9 @@ class ChartsMazeGUI(tk.Tk):
         self._stk_metric_vars:      dict  = {}
         self._stk_vpane             = None
         self._stk_sash_placed       = False
+        self._growth_fig            = None
+        self._growth_canvas         = None
+        self._growth_chart_frame    = None
 
         self._build()
 
@@ -563,30 +566,36 @@ class ChartsMazeGUI(tk.Tk):
         self._stk_sec_tree = _styled_tree(sf, ["Sector", "Quad"], [130, 72])
         self._stk_sec_tree.bind("<<TreeviewSelect>>", self._on_stk_sector_select)
 
-        # Middle: industry list
-        inf = tk.Frame(hpane, bg=BG, width=230)
-        hpane.add(inf, minsize=150, stretch="never")
+        # Middle: vertical split — industry list (top) + sector/industry fundamental (bottom)
+        mid_vpane = tk.PanedWindow(hpane, orient="vertical", bg=BG,
+                                   sashwidth=5, sashrelief="flat", width=240)
+        hpane.add(mid_vpane, minsize=170, stretch="never")
+
+        inf = tk.Frame(mid_vpane, bg=BG)
+        mid_vpane.add(inf, stretch="always", minsize=120)
         tk.Label(inf, text="INDUSTRIES", bg=BG, fg=FG2, font=_FONT_SM).pack(
             anchor="w", padx=6, pady=(4, 2))
         self._stk_ind_tree = _styled_tree(inf, ["Industry", "Trend"], [160, 66])
         self._stk_ind_tree.bind("<<TreeviewSelect>>", self._on_stk_industry_select)
 
-        # Right: vertical split — stock list (top) + fundamentals (bottom)
+        fund_mid = tk.Frame(mid_vpane, bg=BG)
+        mid_vpane.add(fund_mid, stretch="always", minsize=120)
+        self._build_ind_fund_panel(fund_mid)
+
+        # Right: vertical split — stock list (top) + stock fundamentals (bottom)
         rf = tk.Frame(hpane, bg=BG)
         hpane.add(rf, stretch="always")
         self._stk_vpane = tk.PanedWindow(rf, orient="vertical", bg=BG,
                                           sashwidth=5, sashrelief="flat")
         self._stk_vpane.pack(fill="both", expand=True)
 
-        # Stock list
         sl = tk.Frame(self._stk_vpane, bg=BG)
         self._stk_vpane.add(sl, stretch="always", minsize=120)
         self._build_stock_list(sl)
 
-        # Fundamentals row
         fl = tk.Frame(self._stk_vpane, bg=BG)
-        self._stk_vpane.add(fl, stretch="always", minsize=140)
-        self._build_fund_split(fl)
+        self._stk_vpane.add(fl, stretch="always", minsize=200)
+        self._build_stock_fund_panel(fl)
 
     def _build_stock_list(self, parent: tk.Frame) -> None:
         bar = tk.Frame(parent, bg=BG)
@@ -613,21 +622,6 @@ class ChartsMazeGUI(tk.Tk):
         self._stk_tree.bind("<Double-1>", self._on_stock_dbl)
         # heading indicator for default sort
         self._stk_tree.heading("RS", text="RS ▼")
-
-    def _build_fund_split(self, parent: tk.Frame) -> None:
-        hpane = tk.PanedWindow(parent, orient="horizontal", bg=BG,
-                               sashwidth=5, sashrelief="flat")
-        hpane.pack(fill="both", expand=True)
-
-        # Left: industry/sector fundamental
-        lf = tk.Frame(hpane, bg=BG)
-        hpane.add(lf, stretch="always", minsize=200)
-        self._build_ind_fund_panel(lf)
-
-        # Right: stock fundamental (quarterly table + metric cards)
-        rf = tk.Frame(hpane, bg=BG)
-        hpane.add(rf, stretch="always", minsize=260)
-        self._build_stock_fund_panel(rf)
 
     def _build_ind_fund_panel(self, parent: tk.Frame) -> None:
         tk.Label(parent, text="SECTOR / INDUSTRY FUNDAMENTAL",
@@ -703,6 +697,28 @@ class ChartsMazeGUI(tk.Tk):
         self._qtr_tree.tag_configure("q_mix",  foreground=YELLOW)
         self._qtr_tree.pack(fill="x")
 
+        # Growth charts (2×2 matplotlib)
+        if _HAS_MPL:
+            self._growth_chart_frame = tk.Frame(parent, bg=BG)
+            self._growth_chart_frame.pack(fill="both", expand=True, padx=6, pady=(0, 4))
+            plt.rcParams.update(_MPL_RC)
+            self._growth_fig, axes = plt.subplots(2, 2, facecolor=BG)
+            self._growth_fig.subplots_adjust(hspace=0.45, wspace=0.35,
+                                              left=0.10, right=0.97,
+                                              top=0.92, bottom=0.12)
+            titles = ["QoQ EPS %", "YoY EPS %", "QoQ Sales %", "YoY Sales %"]
+            for ax, title in zip(axes.flat, titles):
+                _style_axes(ax)
+                ax.set_title(title, fontsize=8, color=FG2, pad=4)
+                ax.set_xticks([]); ax.set_yticks([])
+                ax.text(0.5, 0.5, "—", transform=ax.transAxes,
+                        ha="center", va="center", color=FG2, fontsize=11)
+            self._growth_canvas = FigureCanvasTkAgg(self._growth_fig,
+                                                     master=self._growth_chart_frame)
+            self._growth_canvas.get_tk_widget().configure(bg=BG, highlightthickness=0)
+            self._growth_canvas.get_tk_widget().pack(fill="both", expand=True)
+            self._growth_canvas.draw()
+
         # Metric cards
         cards = tk.Frame(parent, bg=BG)
         cards.pack(fill="x", padx=6, pady=4)
@@ -722,6 +738,47 @@ class ChartsMazeGUI(tk.Tk):
             val_lbl = tk.Label(card, textvariable=var, bg=CARD, fg=FG2, font=_FONT_BOLD)
             val_lbl.pack()
             self._stk_metric_vars[key] = (var, val_lbl)
+
+    def _draw_growth_charts(self, qtrs: list) -> None:
+        """Redraw the 2×2 growth bar charts for the selected stock's quarterly data."""
+        if not _HAS_MPL or self._growth_fig is None:
+            return
+        axes = self._growth_fig.axes
+        if len(axes) < 4:
+            return
+        datasets = [
+            (axes[0], "QoQ EPS %",   [q.qoq_eps   for q in qtrs]),
+            (axes[1], "YoY EPS %",   [q.yoy_eps   for q in qtrs]),
+            (axes[2], "QoQ Sales %", [q.qoq_sales for q in qtrs]),
+            (axes[3], "YoY Sales %", [q.yoy_sales for q in qtrs]),
+        ]
+        # Quarters ordered oldest→newest (left→right) for the charts
+        qtrs_ordered = list(reversed(qtrs))
+        labels = [q.quarter for q in qtrs_ordered]
+        for ax, title, _ in datasets:
+            ax.clear()
+            _style_axes(ax)
+            ax.set_title(title, fontsize=8, color=FG2, pad=4)
+        for ax, title, raw_vals in datasets:
+            vals_ordered = list(reversed(raw_vals))
+            has_data = any(v is not None for v in vals_ordered)
+            if not has_data:
+                ax.set_xticks([]); ax.set_yticks([])
+                ax.text(0.5, 0.5, "—", transform=ax.transAxes,
+                        ha="center", va="center", color=FG2, fontsize=11)
+                continue
+            x = range(len(labels))
+            colors = [GREEN if (v is not None and v > 0) else RED
+                      for v in vals_ordered]
+            heights = [v if v is not None else 0.0 for v in vals_ordered]
+            ax.bar(x, heights, color=colors, width=0.6, zorder=2)
+            ax.axhline(0, color=BORDER, linewidth=0.7, zorder=1)
+            ax.set_xticks(list(x))
+            ax.set_xticklabels(labels, fontsize=7, rotation=30, ha="right", color=FG)
+            ax.tick_params(axis="y", labelsize=7, colors=FG)
+            ax.yaxis.grid(True, color=GRID_V, linewidth=0.4, zorder=0)
+            ax.set_axisbelow(True)
+        self._growth_canvas.draw_idle()
 
     def _build_sector_panel(self, parent: tk.Widget) -> None:
         pane = tk.Frame(parent, bg=BG, width=390)
@@ -1163,6 +1220,7 @@ class ChartsMazeGUI(tk.Tk):
                 _fmt(q.yoy_sales, 1) if q.yoy_sales is not None else "—",
                 _fmt(q.opm, 2) if q.opm is not None else "—",
             ))
+        self._draw_growth_charts(qtrs)
 
     # ── sort / populate helpers ────────────────────────────────────────────────
 

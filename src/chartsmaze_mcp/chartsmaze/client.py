@@ -558,7 +558,12 @@ def _extract_quarterly_inner(row: dict) -> list[QuarterlyData]:
         n  = int(lm.group(1) or 0)
         cl = col.lower()
         if "quarter" in cl:
-            quarter_labels[n] = str(raw).strip()
+            candidate = str(raw).strip()
+            # Only accept a value that looks like a date label (e.g. "Dec 25", "Sep-24")
+            # Ignore numeric / ratio values like "0.88" that come from columns such as
+            # "QoQ Quarterly Change Latest".
+            if _QTR_RE.search(candidate) or re.match(r'Q[1-4]\b', candidate, re.I):
+                quarter_labels[n] = candidate
             continue
         val = _flt(raw)
         if val is None:
