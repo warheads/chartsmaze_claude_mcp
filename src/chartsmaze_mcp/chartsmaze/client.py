@@ -67,10 +67,12 @@ _COL_EPS_YOY   = "YoY % EPS Latest"
 _COL_SALES_YOY = "YoY % Sales Latest"
 _COL_PE        = "P/E"
 
-# Extended columns from rs_filter.gz (may vary by data version).
-_COL_RETURNS_1M   = "1 Month Returns(%)"
-_COL_RETURNS_3M   = "3 Month Returns(%)"
-_COL_52W_HIGH_PCT = "% from 52W High"
+# Extended columns from rs_filter.gz — try multiple name variants defensively.
+# The actual column name is detected at runtime via _pick_col().
+_COL_RETURNS_1M_VARIANTS   = ["1 Month Returns(%)", "1M Returns(%)", "1 Month Return(%)"]
+_COL_RETURNS_3M_VARIANTS   = ["3 Month Returns(%)", "3M Returns(%)", "3 Month Return(%)"]
+_COL_52W_HIGH_VARIANTS     = ["% from 52W High", "52W High%", "Stock % from 52W High",
+                               "% From 52W High", "Pct From 52W High"]
 
 # Quarterly parser constants.
 _MONTH_IDX: dict[str, int] = {
@@ -326,6 +328,7 @@ class ChartsMazeClient:
                 name=r.get(_COL_COMPANY) or ticker,
                 sector=sec,
                 industry=r.get(_COL_INDUSTRY, "").strip() or None,
+                exchange=r.get(_COL_EXCHANGE, "NSE").strip().upper() or "NSE",
                 price=_flt(r.get(_COL_PRICE)),
                 change_pct=_flt(r.get(_COL_CHANGE_1D)),
                 volume_20d_ma=int(vol_20d) if vol_20d is not None else None,
@@ -334,6 +337,10 @@ class ChartsMazeClient:
                 revenue_growth_pct=sales_yoy,
                 market_cap=_flt(r.get(_COL_MARKET_CAP)),
                 pe_ratio=_flt(f.get(_COL_PE)) if f else None,
+                rs_rating=_flt(r.get(_COL_RS_RATING)),
+                returns_1m=_pick_col(r, _COL_RETURNS_1M_VARIANTS),
+                returns_3m=_pick_col(r, _COL_RETURNS_3M_VARIANTS),
+                from_52w_high_pct=_pick_col(r, _COL_52W_HIGH_VARIANTS),
             ))
 
         return sorted(stocks, key=lambda s: s.eps_growth_pct or 0.0, reverse=True)
@@ -356,6 +363,7 @@ class ChartsMazeClient:
                 name=r.get(_COL_COMPANY) or target,
                 sector=r.get(_COL_SECTOR, "").strip() or None,
                 industry=r.get(_COL_INDUSTRY, "").strip() or None,
+                exchange=r.get(_COL_EXCHANGE, "NSE").strip().upper() or "NSE",
                 price=_flt(r.get(_COL_PRICE)),
                 change_pct=_flt(r.get(_COL_CHANGE_1D)),
                 volume_20d_ma=int(vol_20d) if vol_20d is not None else None,
@@ -364,6 +372,10 @@ class ChartsMazeClient:
                 revenue_growth_pct=_flt(f.get(_COL_SALES_YOY)),
                 market_cap=_flt(r.get(_COL_MARKET_CAP)),
                 pe_ratio=_flt(f.get(_COL_PE)) if f else None,
+                rs_rating=_flt(r.get(_COL_RS_RATING)),
+                returns_1m=_pick_col(r, _COL_RETURNS_1M_VARIANTS),
+                returns_3m=_pick_col(r, _COL_RETURNS_3M_VARIANTS),
+                from_52w_high_pct=_pick_col(r, _COL_52W_HIGH_VARIANTS),
             )
         return None
 
@@ -388,6 +400,7 @@ class ChartsMazeClient:
                 name=r.get(_COL_COMPANY) or ticker,
                 sector=sec or None,
                 industry=ind or None,
+                exchange=r.get(_COL_EXCHANGE, "NSE").strip().upper() or "NSE",
                 price=_flt(r.get(_COL_PRICE)),
                 change_pct=_flt(r.get(_COL_CHANGE_1D)),
                 volume_20d_ma=int(vol_20d) if vol_20d is not None else None,
@@ -396,9 +409,9 @@ class ChartsMazeClient:
                 market_cap=_flt(r.get(_COL_MARKET_CAP)),
                 pe_ratio=_flt(f.get(_COL_PE)) if f else None,
                 rs_rating=_flt(r.get(_COL_RS_RATING)),
-                returns_1m=_flt(r.get(_COL_RETURNS_1M)),
-                returns_3m=_flt(r.get(_COL_RETURNS_3M)),
-                from_52w_high_pct=_flt(r.get(_COL_52W_HIGH_PCT)),
+                returns_1m=_pick_col(r, _COL_RETURNS_1M_VARIANTS),
+                returns_3m=_pick_col(r, _COL_RETURNS_3M_VARIANTS),
+                from_52w_high_pct=_pick_col(r, _COL_52W_HIGH_VARIANTS),
             ))
         for lst in result.values():
             lst.sort(key=lambda s: s.rs_rating or 0.0, reverse=True)
@@ -589,6 +602,15 @@ def _flt(v: Any) -> Optional[float]:
 def _int(v: Any) -> Optional[int]:
     f = _flt(v)
     return int(f) if f is not None else None
+
+
+def _pick_col(row: dict, variants: list[str]) -> Optional[float]:
+    """Return the first non-None float found among *variants* of a column name."""
+    for name in variants:
+        v = _flt(row.get(name))
+        if v is not None:
+            return v
+    return None
 
 
 

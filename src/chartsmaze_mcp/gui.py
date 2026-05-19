@@ -401,8 +401,8 @@ class ChartsMazeGUI(tk.Tk):
     def _on_win_configure(self, event: tk.Event) -> None:
         if event.widget is not self:
             return
+        h = self.winfo_height()
         if not self._sash_placed:
-            h = self.winfo_height()
             if h > 300:
                 self._sash_placed = True
                 self._paned.sash_place(0, 0, int(h * 0.40))
@@ -412,6 +412,12 @@ class ChartsMazeGUI(tk.Tk):
             if self._resize_timer:
                 self.after_cancel(self._resize_timer)
             self._resize_timer = self.after(80, self._sync_chart_sizes)
+        # Stocks-tab vertical sash: stock list 55%, fundamentals 45%
+        if not self._stk_sash_placed and self._stk_vpane and h > 300:
+            self._stk_sash_placed = True
+            self.after(150, lambda: self._stk_vpane.sash_place(
+                0, 0, int(self._stk_vpane.winfo_height() * 0.55)
+            ))
 
     # ── layout ─────────────────────────────────────────────────────────────────
 
@@ -920,6 +926,10 @@ class ChartsMazeGUI(tk.Tk):
         else:
             sector_name = iid[3:]
             inds = self._industries.get(sector_name, [])
+            # Show sector fundamentals when a sector (not ALL) is selected
+            sec_obj = next((s for s in self._sectors if s.name == sector_name), None)
+            if sec_obj:
+                self._update_ind_fundamentals(sec_obj)
         if self._stk_ind_tree:
             for i in sorted(inds, key=lambda x: x.trend_score(), reverse=True):
                 quad = i.quadrant.value if i.quadrant else "—"
@@ -939,16 +949,14 @@ class ChartsMazeGUI(tk.Tk):
         # Gather stocks for this industry
         stocks = self._stocks_by_industry.get(ind_name, [])
         self._populate_stock_list(stocks)
-        # Update industry fundamentals
-        sec_sel = self._stk_sec_tree.selection() if self._stk_sec_tree else ()
-        if sec_sel:
-            sec_iid = sec_sel[0]
-            if sec_iid != "__ALL__":
-                sector_name = sec_iid[3:]
-                inds = self._industries.get(sector_name, [])
-                ind_obj = next((i for i in inds if i.name == ind_name), None)
-                if ind_obj:
-                    self._update_ind_fundamentals(ind_obj)
+        # Update industry fundamentals — search all sectors for the industry object
+        ind_obj = None
+        for inds in self._industries.values():
+            ind_obj = next((i for i in inds if i.name == ind_name), None)
+            if ind_obj:
+                break
+        if ind_obj:
+            self._update_ind_fundamentals(ind_obj)
 
     def _populate_stock_list(self, stocks: list) -> None:
         if not self._stk_tree:
@@ -1014,8 +1022,8 @@ class ChartsMazeGUI(tk.Tk):
         idx = self._stk_tree.index(sel[0])
         if idx >= len(self._displayed_stocks):
             return
-        ticker = self._displayed_stocks[idx].ticker
-        url = f"https://www.tradingview.com/chart/?symbol=NSE:{ticker}"
+        stock = self._displayed_stocks[idx]
+        url = f"https://www.tradingview.com/chart/?symbol={stock.tv_symbol()}"
         webbrowser.open(url)
 
     def _update_ind_fundamentals(self, obj) -> None:

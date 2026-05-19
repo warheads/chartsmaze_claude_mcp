@@ -173,6 +173,7 @@ class StockData(BaseModel):
     name:                Optional[str]   = None
     sector:              Optional[str]   = None
     industry:            Optional[str]   = None
+    exchange:            Optional[str]   = None
     price:               Optional[float] = None
     change_pct:          Optional[float] = None
     volume:              Optional[int]   = None
@@ -186,3 +187,10 @@ class StockData(BaseModel):
     returns_1m:          Optional[float] = None
     returns_3m:          Optional[float] = None
     from_52w_high_pct:   Optional[float] = None
+
+    def tv_symbol(self) -> str:
+        """Return the TradingView symbol string, normalising ticker separators."""
+        exch   = (self.exchange or "NSE").strip().upper()
+        # TradingView uses underscores; ChartsMaze may store hyphens or spaces
+        symbol = self.ticker.upper().replace("-", "_").replace(" ", "_")
+        return f"{exch}:{symbol}"
