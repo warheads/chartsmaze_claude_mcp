@@ -511,20 +511,21 @@ def _extract_quarterly(row: dict) -> list[QuarterlyData]:
 
 def _assign_qtr_field(q: dict, cl: str, val: float) -> None:
     """Classify a lowercased column name and assign val to the right QuarterlyData field."""
-    if "opm" in cl or ("operating" in cl and "margin" in cl):
+    is_growth = "qoq" in cl or "yoy" in cl or "q-o-q" in cl or "y-o-y" in cl
+    if ("opm" in cl or ("operating" in cl and "margin" in cl)) and not is_growth:
         q.setdefault("opm", val)
-    elif ("qoq" in cl or "q-o-q" in cl) and (
-            "sales" in cl or "revenue" in cl or "turnover" in cl):
-        q.setdefault("qoq_sales", val)
-    elif ("yoy" in cl or "y-o-y" in cl) and (
-            "sales" in cl or "revenue" in cl or "turnover" in cl):
-        q.setdefault("yoy_sales", val)
+    elif is_growth and ("sales" in cl or "revenue" in cl or "turnover" in cl):
+        if "qoq" in cl or "q-o-q" in cl:
+            q.setdefault("qoq_sales", val)
+        else:
+            q.setdefault("yoy_sales", val)
     elif "sales" in cl or "revenue" in cl or "turnover" in cl:
         q.setdefault("sales", val)
-    elif ("qoq" in cl or "q-o-q" in cl) and "eps" in cl:
-        q.setdefault("qoq_eps", val)
-    elif ("yoy" in cl or "y-o-y" in cl) and "eps" in cl:
-        q.setdefault("yoy_eps", val)
+    elif is_growth and "eps" in cl:
+        if "qoq" in cl or "q-o-q" in cl:
+            q.setdefault("qoq_eps", val)
+        else:
+            q.setdefault("yoy_eps", val)
     elif "eps" in cl or "earnings per share" in cl:
         q.setdefault("eps", val)
 
@@ -561,17 +562,22 @@ def _extract_quarterly_inner(row: dict) -> list[QuarterlyData]:
         n  = int(lm.group(1) or 0)
         cl = col.lower()
         if "quarter" in cl:
-            candidate = str(raw).strip()
-            # Only accept a value that looks like a date label (e.g. "Dec 25", "Mar 2026")
-            # Ignore numeric / ratio values like "0.88" that come from columns such as
-            # "QoQ Quarterly Change Latest".
-            m2 = _QTR_RE.search(candidate)
-            if m2:
-                # Normalise to 4-digit year so it matches date-tagged keys exactly.
-                quarter_labels[n] = f"{m2.group(1).capitalize()} {_norm_yr(m2.group(2))}"
-            elif re.match(r'Q[1-4]\b', candidate, re.I):
-                quarter_labels[n] = candidate
-            continue
+            # Only the dedicated quarter-label column (e.g. "Latest Quarter",
+            # "Quarter Latest") should be used for the quarter name.
+            # Columns like "EPS Latest Quarter", "Sales Latest Quarter" contain
+            # "quarter" as a suffix to a metric name — strip "latest(-N)?" and check
+            # that what remains is just "quarter"; otherwise fall through to data.
+            remainder = re.sub(r'\blatest(?:-\d+)?\b', '', cl, flags=re.I)
+            remainder = re.sub(r'[^a-z]+', ' ', remainder).strip()
+            if remainder == 'quarter':
+                candidate = str(raw).strip()
+                m2 = _QTR_RE.search(candidate)
+                if m2:
+                    quarter_labels[n] = f"{m2.group(1).capitalize()} {_norm_yr(m2.group(2))}"
+                elif re.match(r'Q[1-4]\b', candidate, re.I):
+                    quarter_labels[n] = candidate
+                continue  # never a data column
+            # else: "EPS Latest Quarter" etc. — fall through to data extraction
         val = _flt(raw)
         if val is None:
             continue
