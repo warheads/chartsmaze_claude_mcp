@@ -582,20 +582,32 @@ class ChartsMazeGUI(tk.Tk):
         mid_vpane.add(fund_mid, stretch="always", minsize=120)
         self._build_ind_fund_panel(fund_mid)
 
-        # Right: vertical split — stock list (top) + stock fundamentals (bottom)
+        # Right: vertical PanedWindow
+        #   Top:    horizontal split — stock list (left) | quarterly table + cards (right)
+        #   Bottom: growth charts — full width, spacious
         rf = tk.Frame(hpane, bg=BG)
         hpane.add(rf, stretch="always")
         self._stk_vpane = tk.PanedWindow(rf, orient="vertical", bg=BG,
                                           sashwidth=5, sashrelief="flat")
         self._stk_vpane.pack(fill="both", expand=True)
 
-        sl = tk.Frame(self._stk_vpane, bg=BG)
-        self._stk_vpane.add(sl, stretch="always", minsize=120)
+        # Top: stocks | fundamentals side-by-side
+        top_hpane = tk.PanedWindow(self._stk_vpane, orient="horizontal", bg=BG,
+                                   sashwidth=5, sashrelief="flat")
+        self._stk_vpane.add(top_hpane, stretch="always", minsize=180)
+
+        sl = tk.Frame(top_hpane, bg=BG)
+        top_hpane.add(sl, stretch="always", minsize=300)
         self._build_stock_list(sl)
 
-        fl = tk.Frame(self._stk_vpane, bg=BG)
-        self._stk_vpane.add(fl, stretch="always", minsize=200)
-        self._build_stock_fund_panel(fl)
+        qf = tk.Frame(top_hpane, bg=BG)
+        top_hpane.add(qf, stretch="never", minsize=500)
+        self._build_stock_qtr_cards(qf)
+
+        # Bottom: growth charts, takes the rest of the vertical space
+        gf = tk.Frame(self._stk_vpane, bg=BG)
+        self._stk_vpane.add(gf, stretch="always", minsize=200)
+        self._build_growth_panel(gf)
 
     def _build_stock_list(self, parent: tk.Frame) -> None:
         bar = tk.Frame(parent, bg=BG)
@@ -609,7 +621,7 @@ class ChartsMazeGUI(tk.Tk):
         ).pack(side="right")
         self._stk_tree = _styled_tree(
             parent, _STK_COLS,
-            widths=[120, 52, 160, 62, 62, 72, 120],
+            widths=[105, 44, 210, 60, 60, 72, 140],
         )
         self._stk_tree.tag_configure("rs_strong", foreground=GREEN)
         self._stk_tree.tag_configure("rs_good",   foreground="#80EE80")
@@ -670,13 +682,14 @@ class ChartsMazeGUI(tk.Tk):
             val_lbl.pack(side="left")
             self._ind_fund_vars[key] = (var, val_lbl)
 
-    def _build_stock_fund_panel(self, parent: tk.Frame) -> None:
-        tk.Label(parent, text="FUNDAMENTAL & TECHNICAL PARAMETERS",
-                 bg=BG, fg=ACCENT, font=_FONT_BOLD).pack(pady=(8, 4))
+    def _build_stock_qtr_cards(self, parent: tk.Frame) -> None:
+        """Quarterly earnings table + metric cards — sits top-right beside the stock list."""
+        tk.Label(parent, text="QUARTERLY FUNDAMENTALS",
+                 bg=BG, fg=ACCENT, font=_FONT_BOLD).pack(anchor="w", padx=8, pady=(6, 4))
 
-        # Quarterly treeview (fixed height = 4 rows, not expanding)
+        # Quarterly treeview (fixed height = 4 rows)
         qtree_wrap = tk.Frame(parent, bg=BG)
-        qtree_wrap.pack(fill="x", padx=6, pady=(0, 4))
+        qtree_wrap.pack(fill="x", padx=6, pady=(0, 6))
         uid = f"QTR{id(qtree_wrap)}.Treeview"
         s = ttk.Style()
         s.configure(uid, background=CARD, foreground=FG, fieldbackground=CARD,
@@ -684,7 +697,7 @@ class ChartsMazeGUI(tk.Tk):
         s.configure(f"{uid}.Heading", background=SURFACE, foreground=ACCENT,
                     relief="flat", font=_FONT_SM)
         s.map(uid, background=[("selected", BORDER)], foreground=[("selected", ACCENT)])
-        qwidths = [62, 52, 62, 62, 52, 72, 72, 55]
+        qwidths = [72, 58, 68, 68, 62, 75, 75, 60]
         self._qtr_tree = ttk.Treeview(
             qtree_wrap, columns=_QTR_COLS, show="headings",
             style=uid, height=4, selectmode="none",
@@ -697,47 +710,52 @@ class ChartsMazeGUI(tk.Tk):
         self._qtr_tree.tag_configure("q_mix",  foreground=YELLOW)
         self._qtr_tree.pack(fill="x")
 
-        # Growth charts (2×2 matplotlib)
-        if _HAS_MPL:
-            self._growth_chart_frame = tk.Frame(parent, bg=BG)
-            self._growth_chart_frame.pack(fill="both", expand=True, padx=6, pady=(0, 4))
-            plt.rcParams.update(_MPL_RC)
-            self._growth_fig, axes = plt.subplots(2, 2, facecolor=BG)
-            self._growth_fig.subplots_adjust(hspace=0.45, wspace=0.35,
-                                              left=0.10, right=0.97,
-                                              top=0.92, bottom=0.12)
-            titles = ["QoQ EPS %", "YoY EPS %", "QoQ Sales %", "YoY Sales %"]
-            for ax, title in zip(axes.flat, titles):
-                _style_axes(ax)
-                ax.set_title(title, fontsize=8, color=FG2, pad=4)
-                ax.set_xticks([]); ax.set_yticks([])
-                ax.text(0.5, 0.5, "—", transform=ax.transAxes,
-                        ha="center", va="center", color=FG2, fontsize=11)
-            self._growth_canvas = FigureCanvasTkAgg(self._growth_fig,
-                                                     master=self._growth_chart_frame)
-            self._growth_canvas.get_tk_widget().configure(bg=BG, highlightthickness=0)
-            self._growth_canvas.get_tk_widget().pack(fill="both", expand=True)
-            self._growth_canvas.draw()
-
-        # Metric cards
+        # Metric cards — 2 rows × 2 cols for a compact square layout
         cards = tk.Frame(parent, bg=BG)
-        cards.pack(fill="x", padx=6, pady=4)
+        cards.pack(fill="x", padx=6, pady=6)
         self._stk_metric_vars = {}
         metrics = [
-            ("Market Cap (Cr)",    "market_cap"),
-            ("% from 52W High",    "from_52w_high_pct"),
-            ("1M Returns%",        "returns_1m"),
-            ("3M Returns%",        "returns_3m"),
+            ("Market Cap (Cr)",  "market_cap"),
+            ("% from 52W High",  "from_52w_high_pct"),
+            ("1M Returns%",      "returns_1m"),
+            ("3M Returns%",      "returns_3m"),
         ]
         for i, (label, key) in enumerate(metrics):
-            card = tk.Frame(cards, bg=CARD, padx=10, pady=10)
-            card.grid(row=0, column=i, sticky="nsew", padx=3, pady=3)
-            cards.columnconfigure(i, weight=1)
+            row_i, col_i = divmod(i, 2)
+            card = tk.Frame(cards, bg=CARD, padx=10, pady=8)
+            card.grid(row=row_i, column=col_i, sticky="nsew", padx=3, pady=3)
+            cards.columnconfigure(col_i, weight=1)
             tk.Label(card, text=label, bg=CARD, fg=FG2, font=_FONT_SM).pack()
             var = tk.StringVar(value="—")
             val_lbl = tk.Label(card, textvariable=var, bg=CARD, fg=FG2, font=_FONT_BOLD)
             val_lbl.pack()
             self._stk_metric_vars[key] = (var, val_lbl)
+
+    def _build_growth_panel(self, parent: tk.Frame) -> None:
+        """2×2 growth-rate bar charts — occupies the full bottom-right area."""
+        if not _HAS_MPL:
+            tk.Label(parent, text="pip install matplotlib",
+                     bg=BG, fg=RED, font=_FONT).pack(expand=True)
+            return
+        self._growth_chart_frame = tk.Frame(parent, bg=BG)
+        self._growth_chart_frame.pack(fill="both", expand=True, padx=4, pady=4)
+        plt.rcParams.update(_MPL_RC)
+        self._growth_fig, axes = plt.subplots(2, 2, facecolor=BG)
+        self._growth_fig.subplots_adjust(hspace=0.50, wspace=0.28,
+                                          left=0.07, right=0.98,
+                                          top=0.90, bottom=0.14)
+        titles = ["QoQ EPS %", "YoY EPS %", "QoQ Sales %", "YoY Sales %"]
+        for ax, title in zip(axes.flat, titles):
+            _style_axes(ax)
+            ax.set_title(title, fontsize=9, color=FG2, pad=5)
+            ax.set_xticks([]); ax.set_yticks([])
+            ax.text(0.5, 0.5, "—", transform=ax.transAxes,
+                    ha="center", va="center", color=FG2, fontsize=12)
+        self._growth_canvas = FigureCanvasTkAgg(self._growth_fig,
+                                                 master=self._growth_chart_frame)
+        self._growth_canvas.get_tk_widget().configure(bg=BG, highlightthickness=0)
+        self._growth_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self._growth_canvas.draw()
 
     def _draw_growth_charts(self, qtrs: list) -> None:
         """Redraw the 2×2 growth bar charts for the selected stock's quarterly data."""

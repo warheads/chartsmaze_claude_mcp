@@ -532,7 +532,11 @@ def _assign_qtr_field(q: dict, cl: str, val: float) -> None:
 def _extract_quarterly_inner(row: dict) -> list[QuarterlyData]:
     qtrs: dict[str, dict] = {}
 
-    # ── 1. Date-tagged columns (e.g. "EPS Dec-25") ────────────────────────
+    def _norm_yr(yr_raw: str) -> str:
+        """Normalise a 2- or 4-digit year string to 4-digit (always 20xx for finance)."""
+        return yr_raw if len(yr_raw) == 4 else f"20{yr_raw}"
+
+    # ── 1. Date-tagged columns (e.g. "EPS Dec-25", "OPM Mar 2026") ────────
     for col, raw in row.items():
         m = _QTR_RE.search(col)
         if not m:
@@ -541,12 +545,11 @@ def _extract_quarterly_inner(row: dict) -> list[QuarterlyData]:
         if val is None:
             continue
         mon = m.group(1).capitalize()
-        yr  = m.group(2)[-2:]
-        key = f"{mon} {yr}"
+        yr  = _norm_yr(m.group(2))        # always 4-digit: "2026"
+        key = f"{mon} {yr}"               # "Mar 2026"
         _assign_qtr_field(qtrs.setdefault(key, {}), col.lower(), val)
 
     # ── 2. Latest-N columns — always run; date-tagged values take priority ─
-    # Drop the $ anchor so "EPS Latest (Rs)" and "Sales Latest (Cr)" match too.
     _latest_re = re.compile(r'Latest(?:-(\d+))?', re.I)
     quarter_labels: dict[int, str] = {}
     lat: dict[str, dict] = {}
@@ -559,10 +562,14 @@ def _extract_quarterly_inner(row: dict) -> list[QuarterlyData]:
         cl = col.lower()
         if "quarter" in cl:
             candidate = str(raw).strip()
-            # Only accept a value that looks like a date label (e.g. "Dec 25", "Sep-24")
+            # Only accept a value that looks like a date label (e.g. "Dec 25", "Mar 2026")
             # Ignore numeric / ratio values like "0.88" that come from columns such as
             # "QoQ Quarterly Change Latest".
-            if _QTR_RE.search(candidate) or re.match(r'Q[1-4]\b', candidate, re.I):
+            m2 = _QTR_RE.search(candidate)
+            if m2:
+                # Normalise to 4-digit year so it matches date-tagged keys exactly.
+                quarter_labels[n] = f"{m2.group(1).capitalize()} {_norm_yr(m2.group(2))}"
+            elif re.match(r'Q[1-4]\b', candidate, re.I):
                 quarter_labels[n] = candidate
             continue
         val = _flt(raw)
@@ -584,7 +591,10 @@ def _extract_quarterly_inner(row: dict) -> list[QuarterlyData]:
     def _qkey(k: str) -> tuple:
         parts = k.split()
         if len(parts) == 2 and parts[0] in _MONTH_IDX:
-            return (int(parts[1]), _MONTH_IDX[parts[0]])
+            yr_val = int(parts[1])
+            if yr_val < 100:        # 2-digit fallback (shouldn't happen after norm)
+                yr_val += 2000
+            return (yr_val, _MONTH_IDX[parts[0]])
         return (0, 0)
 
     return [
