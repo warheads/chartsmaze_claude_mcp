@@ -509,10 +509,30 @@ def _extract_quarterly(row: dict) -> list[QuarterlyData]:
         return []
 
 
+def _assign_qtr_field(q: dict, cl: str, val: float) -> None:
+    """Classify a lowercased column name and assign val to the right QuarterlyData field."""
+    if "opm" in cl or ("operating" in cl and "margin" in cl):
+        q.setdefault("opm", val)
+    elif ("qoq" in cl or "q-o-q" in cl) and (
+            "sales" in cl or "revenue" in cl or "turnover" in cl):
+        q.setdefault("qoq_sales", val)
+    elif ("yoy" in cl or "y-o-y" in cl) and (
+            "sales" in cl or "revenue" in cl or "turnover" in cl):
+        q.setdefault("yoy_sales", val)
+    elif "sales" in cl or "revenue" in cl or "turnover" in cl:
+        q.setdefault("sales", val)
+    elif ("qoq" in cl or "q-o-q" in cl) and "eps" in cl:
+        q.setdefault("qoq_eps", val)
+    elif ("yoy" in cl or "y-o-y" in cl) and "eps" in cl:
+        q.setdefault("yoy_eps", val)
+    elif "eps" in cl or "earnings per share" in cl:
+        q.setdefault("eps", val)
+
+
 def _extract_quarterly_inner(row: dict) -> list[QuarterlyData]:
     qtrs: dict[str, dict] = {}
 
-    # ── Date-tagged columns ───────────────────────────────────────────────
+    # ── 1. Date-tagged columns (e.g. "EPS Dec-25") ────────────────────────
     for col, raw in row.items():
         m = _QTR_RE.search(col)
         if not m:
@@ -523,69 +543,39 @@ def _extract_quarterly_inner(row: dict) -> list[QuarterlyData]:
         mon = m.group(1).capitalize()
         yr  = m.group(2)[-2:]
         key = f"{mon} {yr}"
-        q   = qtrs.setdefault(key, {})
-        cl  = col.lower()
-        if "opm" in cl or "operating" in cl:
-            q.setdefault("opm", val)
-        elif ("qoq" in cl or "q-o-q" in cl) and (
-                "sales" in cl or "revenue" in cl or "turnover" in cl):
-            q.setdefault("qoq_sales", val)
-        elif ("yoy" in cl or "y-o-y" in cl) and (
-                "sales" in cl or "revenue" in cl or "turnover" in cl):
-            q.setdefault("yoy_sales", val)
-        elif "sales" in cl or "revenue" in cl or "turnover" in cl:
-            q.setdefault("sales", val)
-        elif ("qoq" in cl or "q-o-q" in cl) and "eps" in cl:
-            q.setdefault("qoq_eps", val)
-        elif ("yoy" in cl or "y-o-y" in cl) and "eps" in cl:
-            q.setdefault("yoy_eps", val)
-        elif "eps" in cl:
-            q.setdefault("eps", val)
+        _assign_qtr_field(qtrs.setdefault(key, {}), col.lower(), val)
 
-    # ── Latest-N columns (fallback when no date tags found) ───────────────
-    if not qtrs:
-        latest_re = re.compile(r'Latest(?:-(\d+))?$', re.I)
-        quarter_labels: dict[int, str] = {}
-        for col, raw in row.items():
-            lm = latest_re.search(col)
-            if not lm:
-                continue
-            n = int(lm.group(1) or 0)
-            cl = col.lower()
-            if "quarter" in cl:
-                quarter_labels[n] = str(raw).strip()
-                continue
-            val = _flt(raw)
-            if val is None:
-                continue
-            key = f"Latest-{n}"
-            q   = qtrs.setdefault(key, {})
-            if "opm" in cl or "operating" in cl:
-                q.setdefault("opm", val)
-            elif ("qoq" in cl or "q-o-q" in cl) and (
-                    "sales" in cl or "revenue" in cl or "turnover" in cl):
-                q.setdefault("qoq_sales", val)
-            elif ("yoy" in cl or "y-o-y" in cl) and (
-                    "sales" in cl or "revenue" in cl or "turnover" in cl):
-                q.setdefault("yoy_sales", val)
-            elif "sales" in cl or "revenue" in cl or "turnover" in cl:
-                q.setdefault("sales", val)
-            elif ("qoq" in cl or "q-o-q" in cl) and "eps" in cl:
-                q.setdefault("qoq_eps", val)
-            elif ("yoy" in cl or "y-o-y" in cl) and "eps" in cl:
-                q.setdefault("yoy_eps", val)
-            elif "eps" in cl:
-                q.setdefault("eps", val)
-        # Replace generic keys with real quarter labels if available
-        relabelled: dict[str, dict] = {}
-        for key, q in qtrs.items():
-            lm2 = re.search(r'\d+$', key)
-            n2  = int(lm2.group()) if lm2 else 0
-            label = quarter_labels.get(n2, key)
-            relabelled[label] = q
-        qtrs = relabelled
+    # ── 2. Latest-N columns — always run; date-tagged values take priority ─
+    # Drop the $ anchor so "EPS Latest (Rs)" and "Sales Latest (Cr)" match too.
+    _latest_re = re.compile(r'Latest(?:-(\d+))?', re.I)
+    quarter_labels: dict[int, str] = {}
+    lat: dict[str, dict] = {}
 
-    # Sort most-recent first using month index, fall back to string sort
+    for col, raw in row.items():
+        lm = _latest_re.search(col)
+        if not lm:
+            continue
+        n  = int(lm.group(1) or 0)
+        cl = col.lower()
+        if "quarter" in cl:
+            quarter_labels[n] = str(raw).strip()
+            continue
+        val = _flt(raw)
+        if val is None:
+            continue
+        _assign_qtr_field(lat.setdefault(f"Latest-{n}", {}), cl, val)
+
+    # Merge Latest-N entries into qtrs, relabelling via quarter_labels.
+    # setdefault ensures date-tagged values win on any field conflict.
+    for key, q in lat.items():
+        lm2   = re.search(r'\d+$', key)
+        n2    = int(lm2.group()) if lm2 else 0
+        label = quarter_labels.get(n2, key)
+        dest  = qtrs.setdefault(label, {})
+        for field, val in q.items():
+            dest.setdefault(field, val)
+
+    # ── 3. Sort most-recent first ──────────────────────────────────────────
     def _qkey(k: str) -> tuple:
         parts = k.split()
         if len(parts) == 2 and parts[0] in _MONTH_IDX:

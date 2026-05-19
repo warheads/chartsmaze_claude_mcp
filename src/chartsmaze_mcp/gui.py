@@ -641,10 +641,12 @@ class ChartsMazeGUI(tk.Tk):
         canvas.pack(side="left", fill="both", expand=True)
         inner = tk.Frame(canvas, bg=SURFACE)
         win = canvas.create_window((0, 0), window=inner, anchor="nw")
-        def _on_inner_conf(e):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            canvas.itemconfig(win, width=canvas.winfo_width())
-        inner.bind("<Configure>", _on_inner_conf)
+        # Two separate bindings: inner resize → scrollregion; canvas resize → frame width.
+        # (winfo_width() is unreliable during init — use the event's width instead.)
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(win, width=e.width))
 
         fields = [
             ("Name",         "name"),
