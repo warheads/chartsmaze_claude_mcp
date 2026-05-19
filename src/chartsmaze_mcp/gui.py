@@ -133,6 +133,41 @@ def _fmt(v: Optional[float], decimals: int = 1, suffix: str = "") -> str:
     return f"{v:.{decimals}f}{suffix}" if v is not None else "—"
 
 
+def _value_color(text: str, key: str = "") -> str:
+    """Return a colour code for a displayed value based on its key and content."""
+    if text in ("—", "", "n/a"):
+        return FG2
+    if key == "name":
+        return ACCENT
+    if key == "quadrant":
+        return _QUAD_FG.get(text, FG)
+    if key in ("rs_ratio", "rs_momentum"):
+        try:
+            return GREEN if float(text) >= 100 else RED
+        except ValueError:
+            return FG
+    if key in ("rank_1w", "rank_1m", "rank_3m", "stock_count"):
+        return FG
+    if key == "market_cap":
+        try:
+            float(text)
+            return ACCENT
+        except ValueError:
+            return FG2
+    if key == "from_52w_high_pct":
+        try:
+            v = float(text.rstrip("%"))
+            return GREEN if v <= 5 else (YELLOW if v <= 15 else RED)
+        except ValueError:
+            return FG
+    # Generic: try to interpret as a signed number / percentage
+    try:
+        v = float(text.rstrip("%"))
+        return GREEN if v > 0 else (RED if v < 0 else FG)
+    except ValueError:
+        return FG
+
+
 def _styled_tree(parent: tk.Widget, columns: list[str], widths: list[int]) -> ttk.Treeview:
     s = ttk.Style()
     s.theme_use("default")
@@ -567,6 +602,11 @@ class ChartsMazeGUI(tk.Tk):
             parent, _STK_COLS,
             widths=[120, 52, 160, 62, 62, 72, 120],
         )
+        self._stk_tree.tag_configure("rs_strong", foreground=GREEN)
+        self._stk_tree.tag_configure("rs_good",   foreground="#80EE80")
+        self._stk_tree.tag_configure("rs_mid",     foreground=YELLOW)
+        self._stk_tree.tag_configure("rs_weak",    foreground=ORANGE)
+        self._stk_tree.tag_configure("rs_low",     foreground=FG2)
         for col in _STK_COLS:
             self._stk_tree.heading(col, command=lambda c=col: self._sort_stock(c))
         self._stk_tree.bind("<<TreeviewSelect>>", self._on_stock_select)
@@ -629,9 +669,10 @@ class ChartsMazeGUI(tk.Tk):
             tk.Label(row, text=label + ":", bg=SURFACE, fg=FG2,
                      font=_FONT_SM, width=14, anchor="w").pack(side="left")
             var = tk.StringVar(value="—")
-            self._ind_fund_vars[key] = var
-            tk.Label(row, textvariable=var, bg=SURFACE, fg=FG,
-                     font=_FONT_SM, anchor="w").pack(side="left")
+            val_lbl = tk.Label(row, textvariable=var, bg=SURFACE, fg=FG2,
+                               font=_FONT_SM, anchor="w")
+            val_lbl.pack(side="left")
+            self._ind_fund_vars[key] = (var, val_lbl)
 
     def _build_stock_fund_panel(self, parent: tk.Frame) -> None:
         tk.Label(parent, text="FUNDAMENTAL & TECHNICAL PARAMETERS",
@@ -655,6 +696,9 @@ class ChartsMazeGUI(tk.Tk):
         for col, w in zip(_QTR_COLS, qwidths):
             self._qtr_tree.heading(col, text=col)
             self._qtr_tree.column(col, width=w, minwidth=w, anchor="center", stretch=True)
+        self._qtr_tree.tag_configure("q_pos",  foreground=GREEN)
+        self._qtr_tree.tag_configure("q_neg",  foreground=RED)
+        self._qtr_tree.tag_configure("q_mix",  foreground=YELLOW)
         self._qtr_tree.pack(fill="x")
 
         # Metric cards
@@ -673,10 +717,9 @@ class ChartsMazeGUI(tk.Tk):
             cards.columnconfigure(i, weight=1)
             tk.Label(card, text=label, bg=CARD, fg=FG2, font=_FONT_SM).pack()
             var = tk.StringVar(value="—")
-            self._stk_metric_vars[key] = var
-            clr = ACCENT
-            tk.Label(card, textvariable=var, bg=CARD, fg=clr,
-                     font=_FONT_BOLD).pack()
+            val_lbl = tk.Label(card, textvariable=var, bg=CARD, fg=FG2, font=_FONT_BOLD)
+            val_lbl.pack()
+            self._stk_metric_vars[key] = (var, val_lbl)
 
     def _build_sector_panel(self, parent: tk.Widget) -> None:
         pane = tk.Frame(parent, bg=BG, width=390)
@@ -999,8 +1042,13 @@ class ChartsMazeGUI(tk.Tk):
             perf1m = _fmt(s.returns_1m, suffix="%")
             perf3m = _fmt(s.returns_3m, suffix="%")
             hi52   = _fmt(s.from_52w_high_pct, suffix="%")
+            rs = s.rs_rating or 0
+            rs_tag = ("rs_strong" if rs >= 80 else
+                      "rs_good"   if rs >= 65 else
+                      "rs_mid"    if rs >= 50 else
+                      "rs_weak"   if rs >= 35 else "rs_low")
             self._stk_tree.insert("", "end",
-                tags=("dim",),
+                tags=(rs_tag,),
                 values=(
                     s.ticker,
                     _fmt(s.rs_rating, 0) if s.rs_rating is not None else "—",
@@ -1075,26 +1123,35 @@ class ChartsMazeGUI(tk.Tk):
             "stock_count":      str(obj.stock_count) if obj.stock_count else "—",
             "from_52w_high_pct": _fmt(getattr(obj, "from_52w_high_pct", None), suffix="%"),
         }
-        for key, var in self._ind_fund_vars.items():
-            var.set(vals.get(key, "—"))
+        for key, (var, lbl) in self._ind_fund_vars.items():
+            text = vals.get(key, "—")
+            var.set(text)
+            lbl.config(fg=_value_color(text, key))
 
     def _update_stock_fundamentals(self, stock) -> None:
         # Metric cards
-        for key, var in self._stk_metric_vars.items():
+        for key, (var, lbl) in self._stk_metric_vars.items():
             val = getattr(stock, key, None)
             if val is None:
-                var.set("—")
+                var.set("—"); lbl.config(fg=FG2)
             elif key == "market_cap":
-                var.set(_fmt(val, 0))
-            else:
+                var.set(_fmt(val, 0)); lbl.config(fg=ACCENT)
+            elif key == "from_52w_high_pct":
                 var.set(_fmt(val, 1, "%"))
+                lbl.config(fg=GREEN if val <= 5 else (YELLOW if val <= 15 else RED))
+            else:   # returns_1m, returns_3m
+                var.set(_fmt(val, 1, "%"))
+                lbl.config(fg=GREEN if val > 0 else RED)
         # Quarterly table
         if not self._qtr_tree:
             return
         self._qtr_tree.delete(*self._qtr_tree.get_children())
         qtrs = self._quarterly.get(stock.ticker, [])
         for q in qtrs:
-            self._qtr_tree.insert("", "end", values=(
+            pos = sum(1 for x in [q.yoy_eps, q.yoy_sales] if x is not None and x > 0)
+            neg = sum(1 for x in [q.yoy_eps, q.yoy_sales] if x is not None and x < 0)
+            qtag = "q_pos" if pos > neg else ("q_neg" if neg > pos else "q_mix")
+            self._qtr_tree.insert("", "end", tags=(qtag,), values=(
                 q.quarter,
                 _fmt(q.eps, 2) if q.eps is not None else "—",
                 _fmt(q.qoq_eps, 1) if q.qoq_eps is not None else "—",
