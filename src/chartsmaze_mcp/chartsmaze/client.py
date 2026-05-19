@@ -585,7 +585,7 @@ def _extract_quarterly(row: dict) -> list[QuarterlyData]:
         return (0, 0)
 
     return [
-        QuarterlyData(quarter=k, **v)
+        QuarterlyData(quarter=k, **qtrs[k])
         for k in sorted(qtrs, key=_qkey, reverse=True)
     ][:4]
 

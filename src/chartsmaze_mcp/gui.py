@@ -422,10 +422,30 @@ class ChartsMazeGUI(tk.Tk):
     # ── layout ─────────────────────────────────────────────────────────────────
 
     def _build(self) -> None:
-        # header
-        hdr = tk.Frame(self, bg=BG, pady=10)
+        # ── header row (title + nav buttons + status + refresh) ──────────────
+        hdr = tk.Frame(self, bg=BG, pady=8)
         hdr.pack(fill="x", padx=16)
+
         tk.Label(hdr, text="ChartsMaze", bg=BG, fg=ACCENT, font=_FONT_H).pack(side="left")
+
+        # Nav buttons sit right next to the title in the same row
+        nav = tk.Frame(hdr, bg=BG)
+        nav.pack(side="left", padx=16)
+        self._nav_market = tk.Button(
+            nav, text="Market",
+            bg=BORDER, fg=ACCENT, activebackground=CARD, activeforeground=ACCENT,
+            relief="flat", font=_FONT_BOLD, padx=14, pady=4,
+            cursor="hand2", command=self._show_market,
+        )
+        self._nav_market.pack(side="left", padx=(0, 2))
+        self._nav_stocks = tk.Button(
+            nav, text="Stocks",
+            bg=CARD, fg=FG2, activebackground=CARD, activeforeground=ACCENT,
+            relief="flat", font=_FONT_BOLD, padx=14, pady=4,
+            cursor="hand2", command=self._show_stocks,
+        )
+        self._nav_stocks.pack(side="left")
+
         self._status_var = tk.StringVar(value="Loading…")
         tk.Label(hdr, textvariable=self._status_var, bg=BG, fg=FG2, font=_FONT_SM).pack(
             side="left", padx=14,
@@ -439,24 +459,15 @@ class ChartsMazeGUI(tk.Tk):
         self._btn.pack(side="right")
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
 
-        # top-level notebook
-        s = ttk.Style()
-        s.configure("Amoled.TNotebook", background=BG, borderwidth=0)
-        s.configure("Amoled.TNotebook.Tab",
-            background=CARD, foreground=FG2, padding=[22, 7], font=_FONT_BOLD)
-        s.map("Amoled.TNotebook.Tab",
-            background=[("selected", BORDER)],
-            foreground=[("selected", ACCENT)])
-        self._top_nb = ttk.Notebook(self, style="Amoled.TNotebook")
-        self._top_nb.pack(fill="both", expand=True, padx=10, pady=(8, 0))
+        # ── content area — full height below the header ───────────────────────
+        self._content = tk.Frame(self, bg=BG)
+        self._content.pack(fill="both", expand=True, padx=10, pady=(6, 0))
 
-        market_tab = tk.Frame(self._top_nb, bg=BG)
-        self._top_nb.add(market_tab, text="   Market   ")
-        self._build_market_tab(market_tab)
+        self._market_frame = tk.Frame(self._content, bg=BG)
+        self._stocks_frame = tk.Frame(self._content, bg=BG)
 
-        stocks_tab = tk.Frame(self._top_nb, bg=BG)
-        self._top_nb.add(stocks_tab, text="   Stocks   ")
-        self._build_stocks_tab(stocks_tab)
+        self._build_market_tab(self._market_frame)
+        self._build_stocks_tab(self._stocks_frame)
 
         # status bar
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
@@ -464,6 +475,21 @@ class ChartsMazeGUI(tk.Tk):
             self, text="", bg=BG, fg=FG2, font=_FONT_SM, anchor="w", pady=4,
         )
         self._score_bar.pack(fill="x", padx=16)
+
+        # Show Market by default
+        self._market_frame.pack(fill="both", expand=True)
+
+    def _show_market(self) -> None:
+        self._stocks_frame.pack_forget()
+        self._market_frame.pack(fill="both", expand=True)
+        self._nav_market.config(bg=BORDER, fg=ACCENT)
+        self._nav_stocks.config(bg=CARD,   fg=FG2)
+
+    def _show_stocks(self) -> None:
+        self._market_frame.pack_forget()
+        self._stocks_frame.pack(fill="both", expand=True)
+        self._nav_stocks.config(bg=BORDER, fg=ACCENT)
+        self._nav_market.config(bg=CARD,   fg=FG2)
 
     def _build_market_tab(self, parent: tk.Frame) -> None:
         # vertical PanedWindow
