@@ -424,6 +424,7 @@ class ChartsMazeGUI(tk.Tk):
         self._growth_fig            = None
         self._growth_canvas         = None
         self._growth_chart_frame    = None
+        self._qtr_web_cache: set    = set()   # tickers already fetched from web
 
         self._build()
 
@@ -922,6 +923,7 @@ class ChartsMazeGUI(tk.Tk):
         self._status_var.set("Loading data — this may take ~30 s…")
         self._sectors = []; self._industries = {}; self._pool = []; self._displayed_inds = []
         self._stocks_by_industry = {}; self._quarterly = {}; self._displayed_stocks = []
+        self._qtr_web_cache.clear()
         self._sec_tree.delete(*self._sec_tree.get_children())
         self._ind_tree.delete(*self._ind_tree.get_children())
         if self._stk_sec_tree:
@@ -1156,6 +1158,16 @@ class ChartsMazeGUI(tk.Tk):
             return
         stock = self._displayed_stocks[idx]
         self._update_stock_fundamentals(stock)
+
+        # Fetch full 4-quarter history from the stock detail page if not cached yet
+        if stock.ticker not in self._qtr_web_cache:
+            self._qtr_web_cache.add(stock.ticker)
+            threading.Thread(
+                target=self._fetch_stock_quarters,
+                args=(stock,),
+                daemon=True,
+            ).start()
+
         self._score_bar.config(
             text=(f"{stock.ticker}  •  {stock.name or ''}  •  "
                   f"RS {_fmt(stock.rs_rating, 0)}  •  "
@@ -1163,6 +1175,39 @@ class ChartsMazeGUI(tk.Tk):
                   f"3M {_fmt(stock.returns_3m, suffix='%')}  "
                   f"52W Hi {_fmt(stock.from_52w_high_pct, suffix='%')}")
         )
+
+    def _fetch_stock_quarters(self, stock) -> None:
+        """Background thread: scrape 4-quarter history from the ChartsMaze stock page."""
+        from .chartsmaze.client import ChartsMazeClient
+
+        async def _run():
+            async with ChartsMazeClient(
+                session_cookie=os.environ.get("CHARTSMAZE_SESSION")
+            ) as cm:
+                return await cm.get_quarterly_from_page(stock.ticker, stock.exchange)
+
+        try:
+            qtrs = asyncio.run(_run())
+        except Exception:
+            qtrs = []
+
+        if qtrs:
+            self.after(0, self._on_qtrs_fetched, stock.ticker, qtrs)
+        else:
+            # Remove from cache so the user can retry by re-selecting the stock
+            self._qtr_web_cache.discard(stock.ticker)
+
+    def _on_qtrs_fetched(self, ticker: str, qtrs: list) -> None:
+        """UI-thread callback: store web-fetched quarters and refresh if still selected."""
+        self._quarterly[ticker] = qtrs
+        if not self._stk_tree:
+            return
+        sel = self._stk_tree.selection()
+        if not sel:
+            return
+        idx = self._stk_tree.index(sel[0])
+        if idx < len(self._displayed_stocks) and self._displayed_stocks[idx].ticker == ticker:
+            self._update_stock_fundamentals(self._displayed_stocks[idx])
 
     def _on_stock_dbl(self, event: tk.Event) -> None:
         self._open_tv_chart()

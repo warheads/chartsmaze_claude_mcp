@@ -431,6 +431,97 @@ class ChartsMazeClient:
         gz_urls = await self._discover_gz_urls(url)
         return [{"url": u} for u in gz_urls]
 
+    async def get_quarterly_from_page(
+        self, ticker: str, exchange: str = "NSE"
+    ) -> list[QuarterlyData]:
+        """
+        Scrape up to 4 quarters of EPS/Sales data from the ChartsMaze stock detail page.
+
+        ChartsMaze's fundamental.gz only carries the most-recent quarter; the full
+        4-quarter history lives in the HTML table on the per-stock page.
+
+        Column order assumed (based on observed page structure):
+          Quarter | EPS | QoQ EPS% | YoY EPS% | Sales | QoQ Sales% | YoY Sales% | OPM%
+        """
+        assert self._ctx is not None
+        page = await self._ctx.new_page()
+        try:
+            # ChartsMaze stock detail URL variants to try
+            slug = ticker.upper()
+            for url in [
+                f"{self.BASE}/stock/{slug}",
+                f"{self.BASE}/stocks/{slug}",
+                f"{self.BASE}/fundamental-analysis/{slug}",
+                f"{self.BASE}/stock/{exchange.upper()}:{slug}",
+            ]:
+                try:
+                    resp = await page.goto(
+                        url, wait_until="domcontentloaded", timeout=25_000
+                    )
+                    if not (resp and resp.ok):
+                        continue
+                    # Wait for at least one quarterly data row to appear
+                    try:
+                        await page.wait_for_selector(
+                            "td.table-body", timeout=12_000
+                        )
+                        break
+                    except Exception:
+                        continue
+                except Exception:
+                    continue
+            else:
+                logger.debug("get_quarterly_from_page: no page found for %s", ticker)
+                return []
+
+            # Extract every <tr> that has ≥8 td.table-body children.
+            # innerText handles any nested <div>/<span> (e.g. the OPM cell).
+            rows_raw: list[list[str]] = await page.evaluate(
+                """
+                () => {
+                    const out = [];
+                    for (const tr of document.querySelectorAll('tr')) {
+                        const cells = tr.querySelectorAll('td.table-body');
+                        if (cells.length >= 8)
+                            out.push(Array.from(cells, td =>
+                                td.innerText.replace(/\\s+/g, ' ').trim()));
+                    }
+                    return out;
+                }
+                """
+            )
+
+            qtrs: list[QuarterlyData] = []
+            for row in rows_raw[:4]:
+                # Normalise quarter label to "Mon YYYY" format
+                m = _QTR_RE.search(row[0])
+                if m:
+                    yr_raw = m.group(2)
+                    yr = yr_raw if len(yr_raw) == 4 else f"20{yr_raw}"
+                    qtr_label = f"{m.group(1).capitalize()} {yr}"
+                else:
+                    qtr_label = row[0]
+                qtrs.append(QuarterlyData(
+                    quarter=qtr_label,
+                    eps=_flt(row[1]),
+                    qoq_eps=_flt(row[2]),
+                    yoy_eps=_flt(row[3]),
+                    sales=_flt(row[4]),
+                    qoq_sales=_flt(row[5]),
+                    yoy_sales=_flt(row[6]),
+                    opm=_flt(row[7]),
+                ))
+            logger.debug("get_quarterly_from_page: %s → %d rows", ticker, len(qtrs))
+            return qtrs
+
+        except Exception:
+            logger.debug(
+                "get_quarterly_from_page failed for %s", ticker, exc_info=True
+            )
+            return []
+        finally:
+            await page.close()
+
     # ------------------------------------------------------------------ internals
 
     async def _ensure_data(self) -> None:
